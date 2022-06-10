@@ -47,6 +47,14 @@ counter_u64_read_one(counter_u64_t c, int cpu)
 	return (*zpcpu_get_cpu(c, cpu));
 }
 
+static inline void
+counter_u64_write_one(counter_u64_t c, uint64_t val, int cpu)
+{
+
+	MPASS(c != EARLY_COUNTER);
+	*zpcpu_get_cpu(c, cpu) = val;
+}
+
 static inline uint64_t
 counter_u64_fetch_inline(uint64_t *c)
 {
@@ -87,6 +95,14 @@ counter_u64_add(counter_u64_t c, int64_t inc)
 
 	KASSERT(IS_BSP() || c != EARLY_COUNTER, ("EARLY_COUNTER used on AP"));
 	zpcpu_add(c, inc);
+}
+
+static inline uint64_t
+counter_u64_fetchadd(counter_u64_t c, int64_t inc)
+{
+
+	KASSERT(IS_BSP() || c != EARLY_COUNTER, ("EARLY_COUNTER used on AP"));
+	return (zpcpu_fetchadd(c, inc));
 }
 
 #endif	/* ! __MACHINE_COUNTER_H__ */

@@ -190,3 +190,204 @@ counter_u64_sysuninit(void *arg)
 	cp = arg;
 	counter_u64_free(*cp);
 }
+
+
+
+/*
+ * Imprecise but cheap resource management.
+ */
+int
+counter_fo_init(struct counter_fo *c, uint64_t limit, uint64_t precision,
+    int flags)
+{
+	int i;
+
+	KASSERT(precision >= mp_ncpus,
+	    ("%s: impossible precision %ju with ncpus %d", __func__,
+	    (uintmax_t )precision, mp_ncpus));
+	KASSERT(limit == 0 || precision < limit / 2,
+	    ("%s: impossible precision %ju with limit %ju", __func__,
+	    (uintmax_t )precision, (uintmax_t )limit));
+
+	c->cf_counter = uma_zalloc_pcpu(pcpu_zone_64, flags);
+	if (c->cf_counter == NULL)
+		return (ENOMEM);
+	mtx_init(&c->cf_mtx, "counter_fo", NULL, MTX_DEF | MTX_NEW);
+	c->cf_budget = precision / mp_ncpus;
+	c->cf_flags = 0;
+	if ((c->cf_pool = limit) > 0) {
+		CPU_FOREACH(i) {
+			c->cf_pool -= c->cf_budget / 2;
+			counter_u64_write_one(c->cf_counter,
+			    c->cf_budget / 2, i);
+		}
+	} else
+		counter_u64_zero(c->cf_counter);
+
+	return (0);
+}
+
+void
+counter_fo_fini(struct counter_fo *c)
+{
+
+	uma_zfree_pcpu(pcpu_zone_64, c->cf_counter);
+	mtx_destroy(&c->cf_mtx);
+}
+
+uint64_t
+counter_fo_fetchall(struct counter_fo *c)
+{
+
+	return (counter_u64_fetch(c->cf_counter) + c->cf_pool);
+}
+
+/*
+ * Add to counter_fo.  Shall never fail, be the val positive or negative.
+ *
+ * If used with negative 'val', the assertion is that counter_fo pool + pcpu
+ * sum is over 'val'.  The function may overcommit individial percpu counter.
+ */
+void
+counter_fo_add(struct counter_fo *c, int64_t val, int flags)
+{
+	int64_t *valp;
+
+	if ((val > 0 && val > c->cf_budget) || -val > c->cf_budget)  {
+		if ((flags & CFO_NOBLOCK) == 0)
+			mtx_lock(&c->cf_mtx);
+		else if (!mtx_trylock(&c->cf_mtx)) {
+			counter_u64_add(c->cf_counter, val);
+			return;
+		}
+		c->cf_pool += val;
+		goto wakeup;
+	}
+
+	val = (int64_t )counter_u64_fetchadd(c->cf_counter, val);
+	if (val > 0 && val <= c->cf_budget)
+		return;
+	/*
+	 * Try to sync with the shared pool.
+	 */
+	if ((flags & CFO_NOBLOCK) == 0)
+		mtx_lock(&c->cf_mtx);
+	else if (!mtx_trylock(&c->cf_mtx))
+		return;
+	critical_enter();
+	valp = zpcpu_get(c->cf_counter);
+	if (*valp > 0 && *valp <= c->cf_budget) {
+		/*
+		 * Migrated (or raced) and there is something left in
+		 * the other CPU budget.  We will pretend that we took
+		 * from there.
+		 */
+		critical_exit();
+		mtx_unlock(&c->cf_mtx);
+		return;
+	}
+
+	*valp += c->cf_pool;
+	if (*valp > (int64_t )c->cf_budget / 2) {
+		c->cf_pool = *valp - c->cf_budget / 2;
+		*valp = c->cf_budget / 2;
+		critical_exit();
+wakeup:
+		if (c->cf_flags & CFO_WAITERS) {
+			c->cf_flags &= ~CFO_WAITERS;
+			wakeup(c);
+		}
+	} else {
+		critical_exit();
+		c->cf_pool = 0;
+	}
+	mtx_unlock(&c->cf_mtx);
+}
+
+/*
+ * Reduce counter_fo by val, that isn't guaranteed to be over 'val'.
+ *
+ * May fail if either CFO_NOBLOCK or CFO_NOSLEEP specified, otherwise
+ * would sleep.
+ *
+ * The function should work with negative val, increasing the counter,
+ * but that doesn't make any sense, lighter counter_fo_add() should be
+ * used instead.
+ */
+bool
+counter_fo_get(struct counter_fo *c, int64_t val, int flags, char *wmesg)
+{
+	int64_t new, *valp;
+
+	if (val > c->cf_budget)  {
+		if ((flags & CFO_NOBLOCK) == 0)
+			mtx_lock(&c->cf_mtx);
+		else if (!mtx_trylock(&c->cf_mtx))
+			return (false);
+restart1:
+		if (c->cf_pool >= val) {
+			c->cf_pool -= val;
+			mtx_unlock(&c->cf_mtx);
+			return (true);
+		} else if (flags & CFO_NOSLEEP) {
+			mtx_unlock(&c->cf_mtx);
+			return (false);
+		} else {
+			c->cf_flags |= CFO_WAITERS;
+			(void )mtx_sleep(c, &c->cf_mtx, PVM, wmesg, 0);
+			goto restart1;
+		}
+	}
+
+
+	new = (int64_t )counter_u64_fetchadd(c->cf_counter, -val);
+	if (new >= 0)
+		return (true);
+	/*
+	 * Try to take from shared pool.
+	 */
+	if ((flags & CFO_NOBLOCK) == 0)
+		mtx_lock(&c->cf_mtx);
+	else if (!mtx_trylock(&c->cf_mtx)) {
+		counter_u64_add(c->cf_counter, val);
+		return (false);
+	}
+restart2:
+	critical_enter();
+	valp = zpcpu_get(c->cf_counter);
+	if (*valp >= 0) {
+		/*
+		 * Migrated (or raced) and there is something left in
+		 * the other CPU budget.  We will pretend that we took
+		 * from there.
+		 */
+		critical_exit();
+		mtx_unlock(&c->cf_mtx);
+	} else if (c->cf_pool > c->cf_budget / 2) {
+		c->cf_pool -= c->cf_budget / 2;
+		mtx_unlock(&c->cf_mtx);
+		*valp += c->cf_budget / 2;
+		critical_exit();
+	} else if (c->cf_pool >= val) {
+		c->cf_pool -= val;
+		mtx_unlock(&c->cf_mtx);
+		*valp += val;
+		critical_exit();
+	} else {
+		/* Depleted. Put increment back and fail or sleep. */
+		*valp += val;
+		critical_exit();
+		if (flags & CFO_NOSLEEP) {
+			mtx_unlock(&c->cf_mtx);
+			return (false);
+		}
+		c->cf_flags |= CFO_WAITERS;
+		(void )mtx_sleep(c, &c->cf_mtx, PVM, wmesg, 0);
+		new = (int64_t )counter_u64_fetchadd(c->cf_counter, -val);
+		if (new < 0)
+			goto restart2;
+		mtx_unlock(&c->cf_mtx);
+	}
+
+	return (true);
+}

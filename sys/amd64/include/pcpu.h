@@ -271,6 +271,22 @@ _Static_assert(sizeof(struct monitorbuf) == 128, "2x cache line");
 	}								\
 } while (0);
 
+#define	zpcpu_fetchadd(base, n) __extension__ ({			\
+	__typeof(*base) __n = (n);					\
+	CTASSERT(sizeof(*base) == 4 || sizeof(*base) == 8);		\
+	switch (sizeof(*base)) {					\
+	case 4:								\
+		__asm __volatile("xaddl\t%1,%%gs:(%0)"			\
+		    : : "r" (base), "ri" (__n) : "memory", "cc");	\
+		break;							\
+	case 8:								\
+		__asm __volatile("xaddq\t%1,%%gs:(%0)"			\
+		    : : "r" (base), "ri" (__n) : "memory", "cc");       \
+		break;							\
+	}								\
+	__n;								\
+})
+
 #endif /* _KERNEL */
 
 #endif /* !_MACHINE_PCPU_H_ */

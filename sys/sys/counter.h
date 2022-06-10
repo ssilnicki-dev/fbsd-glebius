@@ -87,5 +87,36 @@ int64_t	counter_ratecheck(struct counter_rate *, int64_t);
 void counter_u64_sysinit(void *);
 void counter_u64_sysuninit(void *);
 
+/*
+ * counter(9) fetch optimized.
+ * Interface that can either track a resource limit cap, or a running
+ * total of a resource. Optimized towards faster fetching, at the
+ * expense of precision.
+ */
+struct counter_fo {
+	counter_u64_t	cf_counter;
+	uint64_t	cf_budget;	/* Per-cpu budget to take from pool. */
+	uint64_t	cf_pool;	/* Shared pool. */
+	struct mtx	cf_mtx;
+	int		cf_flags;
+#define	CFO_WAITERS	0x00000001
+};
+
+static inline uint64_t
+counter_fo_fetch(struct counter_fo *c)
+{
+
+	return (c->cf_pool);
+}
+
+int	counter_fo_init(struct counter_fo *, uint64_t, uint64_t, int);
+void	counter_fo_fini(struct counter_fo *);
+uint64_t counter_fo_fetchall(struct counter_fo *);
+bool	counter_fo_get(struct counter_fo *, int64_t, int, char *);
+#define	CFO_NOBLOCK	0x00000001
+#define	CFO_NOSLEEP	0x00000002
+void	counter_fo_add(struct counter_fo *, int64_t, int);
+#define	counter_fo_release(c, i)	counter_fo_add((c), (i), 0)
+
 #endif	/* _KERNEL */
 #endif	/* ! __SYS_COUNTER_H__ */
