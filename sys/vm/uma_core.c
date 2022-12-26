@@ -5351,6 +5351,33 @@ uma_zone_reclaim_domain(uma_zone_t zone, int req, int domain)
 	}
 }
 
+static void
+zone_match_and_reclaim(uma_zone_t zone, void *arg)
+{
+	const char *name = arg;
+
+	if (strcmp(zone->uz_name, name) == 0)
+		uma_zone_reclaim(zone, UMA_RECLAIM_DRAIN_ALL);
+}
+
+static int
+sysctl_uma_zone_reclaim(SYSCTL_HANDLER_ARGS)
+{
+	char name[256] = { [0] = '\0' };
+	int error;
+
+	error = sysctl_handle_string(oidp, name, sizeof(name), req);
+
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+
+	zone_foreach(zone_match_and_reclaim, name);
+
+	return (0);
+}
+SYSCTL_PROC(_vm, OID_AUTO, uma_zone_reclaim, CTLTYPE_STRING | CTLFLAG_RW, NULL,
+    0, sysctl_uma_zone_reclaim, "A", "Reclaim all caches from a zone");
+
 /* See uma.h */
 int
 uma_zone_exhausted(uma_zone_t zone)
