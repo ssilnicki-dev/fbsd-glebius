@@ -462,6 +462,7 @@ typedef void (*uma_free)(void *item, vm_size_t size, uint8_t pflag);
 #define	UMA_RECLAIM_DRAIN	1	/* release bucket cache */
 #define	UMA_RECLAIM_DRAIN_CPU	2	/* release bucket and per-CPU caches */
 #define	UMA_RECLAIM_TRIM	3	/* trim bucket cache to WSS */
+#define	UMA_RECLAIM_DRAIN_ALL	4	/* as much as possible, no shrink */
 void uma_reclaim(int req);
 void uma_reclaim_domain(int req, int domain);
 void uma_zone_reclaim(uma_zone_t, int req);

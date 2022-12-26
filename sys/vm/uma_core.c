@@ -1439,11 +1439,12 @@ cache_shrink(uma_zone_t zone, void *unused)
 }
 
 static void
-cache_drain_safe_cpu(uma_zone_t zone, void *unused)
+cache_drain_safe_cpu(uma_zone_t zone, void *reqp)
 {
 	uma_cache_t cache;
 	uma_bucket_t b1, b2, b3;
 	int domain;
+	const int req = *(int *)reqp;
 
 	if (zone->uz_flags & UMA_ZFLAG_INTERNAL)
 		return;
@@ -1455,10 +1456,12 @@ cache_drain_safe_cpu(uma_zone_t zone, void *unused)
 	b1 = cache_bucket_unload_alloc(cache);
 
 	/*
-	 * Don't flush SMR zone buckets.  This leaves the zone without a
-	 * bucket and forces every free to synchronize().
+	 * Don't flush SMR zone buckets, unless explicitly asked to.
+	 * This leaves the zone without a bucket and forces next free
+	 * to smr_synchronize().
 	 */
-	if ((zone->uz_flags & UMA_ZONE_SMR) == 0) {
+	if ((zone->uz_flags & UMA_ZONE_SMR) == 0 ||
+	    req == UMA_RECLAIM_DRAIN_ALL) {
 		b2 = cache_bucket_unload_free(cache);
 		b3 = cache_bucket_unload_cross(cache);
 	}
@@ -1466,9 +1469,14 @@ cache_drain_safe_cpu(uma_zone_t zone, void *unused)
 
 	if (b1 != NULL)
 		zone_free_bucket(zone, b1, NULL, domain, false);
-	if (b2 != NULL)
+	if (b2 != NULL) {
+		if ((zone->uz_flags & UMA_ZONE_SMR) != 0)
+			b2->ub_seq = smr_advance(zone->uz_smr);
 		zone_free_bucket(zone, b2, NULL, domain, false);
+	}
 	if (b3 != NULL) {
+		if ((zone->uz_flags & UMA_ZONE_SMR) != 0)
+			b3->ub_seq = smr_advance(zone->uz_smr);
 		/* Adjust the domain so it goes to zone_free_cross. */
 		domain = (domain + 1) % vm_ndomains;
 		zone_free_bucket(zone, b3, NULL, domain, false);
@@ -1483,7 +1491,7 @@ cache_drain_safe_cpu(uma_zone_t zone, void *unused)
  * Zone lock must not be held on call this function.
  */
 static void
-pcpu_cache_drain_safe(uma_zone_t zone)
+pcpu_cache_drain_safe(uma_zone_t zone, int req)
 {
 	int cpu;
 
@@ -1493,9 +1501,9 @@ pcpu_cache_drain_safe(uma_zone_t zone)
 		thread_unlock(curthread);
 
 		if (zone)
-			cache_drain_safe_cpu(zone, NULL);
+			cache_drain_safe_cpu(zone, &req);
 		else
-			zone_foreach(cache_drain_safe_cpu, NULL);
+			zone_foreach(cache_drain_safe_cpu, &req);
 	}
 	thread_lock(curthread);
 	sched_unbind(curthread);
@@ -5269,7 +5277,7 @@ uma_reclaim_domain(int req, int domain)
 	case UMA_RECLAIM_DRAIN_CPU:
 		zone_foreach(uma_reclaim_domain_cb, &args);
 		zone_foreach(cache_shrink, NULL);
-		pcpu_cache_drain_safe(NULL);
+		pcpu_cache_drain_safe(NULL, req);
 		zone_foreach(uma_reclaim_domain_cb, &args);
 		break;
 	default:
@@ -5334,7 +5342,8 @@ uma_zone_reclaim_domain(uma_zone_t zone, int req, int domain)
 		break;
 	case UMA_RECLAIM_DRAIN_CPU:
 		cache_shrink(zone, NULL);
-		pcpu_cache_drain_safe(zone);
+	case UMA_RECLAIM_DRAIN_ALL:
+		pcpu_cache_drain_safe(zone, req);
 		zone_reclaim(zone, domain, M_NOWAIT, true);
 		break;
 	default:
