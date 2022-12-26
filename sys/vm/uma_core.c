@@ -1487,14 +1487,6 @@ pcpu_cache_drain_safe(uma_zone_t zone)
 {
 	int cpu;
 
-	/*
-	 * Polite bucket sizes shrinking was not enough, shrink aggressively.
-	 */
-	if (zone)
-		cache_shrink(zone, NULL);
-	else
-		zone_foreach(cache_shrink, NULL);
-
 	CPU_FOREACH(cpu) {
 		thread_lock(curthread);
 		sched_bind(curthread, cpu);
@@ -5276,6 +5268,7 @@ uma_reclaim_domain(int req, int domain)
 		break;
 	case UMA_RECLAIM_DRAIN_CPU:
 		zone_foreach(uma_reclaim_domain_cb, &args);
+		zone_foreach(cache_shrink, NULL);
 		pcpu_cache_drain_safe(NULL);
 		zone_foreach(uma_reclaim_domain_cb, &args);
 		break;
@@ -5340,6 +5333,7 @@ uma_zone_reclaim_domain(uma_zone_t zone, int req, int domain)
 		zone_reclaim(zone, domain, M_NOWAIT, true);
 		break;
 	case UMA_RECLAIM_DRAIN_CPU:
+		cache_shrink(zone, NULL);
 		pcpu_cache_drain_safe(zone);
 		zone_reclaim(zone, domain, M_NOWAIT, true);
 		break;
