@@ -264,6 +264,30 @@ static tcp_timer_t * const tcp_timersw[TT_N] = {
 	[TT_2MSL] = tcp_timer_2msl,
 };
 
+/* Default timer precisions in milliseconds. */
+static sbintime_t tcp_timerpres[TT_N] = {
+	[TT_DELACK] =	SBT_1MS * 2,	/* 5% of net.inet.tcp.delacktime */
+	[TT_REXMT] =	SBT_1MS * 1,	/* XXX: arbitrary */
+	[TT_PERSIST] =	SBT_1MS * 1,	/* XXX: arbitrary */
+	[TT_KEEP] =	SBT_1MS * 3750,	/* 5% of net.inet.tcp.keepintvl */
+	[TT_2MSL] =	SBT_1MS * 3000,	/* 5% of 2 x net.inet.tcp.msl */
+};
+SYSCTL_PROC(_net_inet_tcp, OID_AUTO, delack_precision,
+    CTLTYPE_S64 | CTLFLAG_RW, &tcp_timerpres[TT_DELACK], 0,
+    sysctl_msec_to_sbintime, "Q", "precision of delayed ACK timer");
+SYSCTL_PROC(_net_inet_tcp, OID_AUTO, rexmt_precision,
+    CTLTYPE_S64 | CTLFLAG_RW, &tcp_timerpres[TT_REXMT], 0,
+    sysctl_msec_to_sbintime, "Q", "precision of retransmission timer");
+SYSCTL_PROC(_net_inet_tcp, OID_AUTO, persist_precision,
+    CTLTYPE_S64 | CTLFLAG_RW, &tcp_timerpres[TT_PERSIST], 0,
+    sysctl_msec_to_sbintime, "Q", "precision of persist timer");
+SYSCTL_PROC(_net_inet_tcp, OID_AUTO, keep_precision,
+    CTLTYPE_S64 | CTLFLAG_RW, &tcp_timerpres[TT_KEEP], 0,
+    sysctl_msec_to_sbintime, "Q", "precision of keep-alive timer");
+SYSCTL_PROC(_net_inet_tcp, OID_AUTO, 2msl_precision,
+    CTLTYPE_S64 | CTLFLAG_RW, &tcp_timerpres[TT_2MSL], 0,
+    sysctl_msec_to_sbintime, "Q", "precision of 2 MSL timer");
+
 /*
  * tcp_output_locked() s a timer specific variation of call to tcp_output(),
  * see tcp_var.h for the rest.  It handles drop request from advanced stacks,
@@ -856,8 +880,8 @@ tcp_timer_activate(struct tcpcb *tp, tt_which which, u_int delta)
 	INP_WLOCK_ASSERT(inp);
 
 	if (delta > 0)
-		callout_when(tick_sbt * delta, 0, C_HARDCLOCK,
-		    &tp->t_timers[which], &tp->t_precisions[which]);
+		callout_when(tick_sbt * delta, tcp_timerpres[which],
+		    C_PREL(63), &tp->t_timers[which], &tp->t_precisions[which]);
 	else
 		tp->t_timers[which] = SBT_MAX;
 
