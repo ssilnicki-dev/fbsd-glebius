@@ -1025,6 +1025,8 @@ m_copyup(struct mbuf *n, int len, int dstoff)
  * Partition an mbuf chain in two pieces, returning the tail --
  * all but the first len0 bytes.  In case of failure, it returns NULL and
  * attempts to restore the chain to its original state.
+ * M_EOR marker will be observed for non-pkthdr mbufs: it will be cleared
+ * at the end of the head and transfered to the tail.
  *
  * Note that the resulting mbufs might be read-only, because the new
  * mbuf can end up sharing an mbuf cluster with the original mbuf if
@@ -1087,8 +1089,7 @@ m_split(struct mbuf *m0, int len0, int wait)
 			M_ALIGN(n, remain);
 	} else if (remain == 0) {
 		n = m->m_next;
-		m->m_next = NULL;
-		return (n);
+		goto done;
 	} else {
 		n = m_get(wait, m->m_type);
 		if (n == NULL)
@@ -1105,7 +1106,12 @@ extpacket:
 	n->m_len = remain;
 	m->m_len = len;
 	n->m_next = m->m_next;
+done:
 	m->m_next = NULL;
+	if (m->m_flags & M_EOR) {
+		m->m_flags &= ~M_EOR;
+		n->m_flags |= M_EOR;
+	}
 	return (n);
 }
 
