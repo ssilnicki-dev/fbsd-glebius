@@ -465,7 +465,7 @@ m_epg_pagelen(const struct mbuf *m, int pidx, int pgoff)
  */
 #define	M_EXT		0x00000001 /* has associated external storage */
 #define	M_PKTHDR	0x00000002 /* start of record */
-#define	M_EOR		0x00000004 /* end of record */
+#define	M_EOR		0x00000004 /* end of record XXXGL: should be M_PROTOx */
 #define	M_RDONLY	0x00000008 /* associated data is marked read-only */
 #define	M_BCAST		0x00000010 /* send/received as link-level broadcast */
 #define	M_MCAST		0x00000020 /* send/received as link-level multicast */
