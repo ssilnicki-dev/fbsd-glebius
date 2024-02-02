@@ -5,7 +5,7 @@
  *	The Regents of the University of California. All Rights Reserved.
  * Copyright (c) 2004-2009 Robert N. M. Watson All Rights Reserved.
  * Copyright (c) 2018 Matthew Macy
- * Copyright (c) 2022 Gleb Smirnoff <glebius@FreeBSD.org>
+ * Copyright (c) 2022-2024 Gleb Smirnoff <glebius@FreeBSD.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -141,9 +141,8 @@ static struct timeout_task unp_gc_task;
 static struct task	unp_defer_task;
 
 /*
- * Both send and receive buffers are allocated PIPSIZ bytes of buffering for
- * stream sockets, although the total for sender and receiver is actually
- * only PIPSIZ.
+ * unix(4) sockets fully bypass the send buffer, thus reserve only receive
+ * space.
  *
  * Datagram sockets really use the sendspace as the maximum datagram size,
  * and don't really want to reserve the sendspace.  Their recvspace should be
@@ -152,11 +151,9 @@ static struct task	unp_defer_task;
 #ifndef PIPSIZ
 #define	PIPSIZ	8192
 #endif
-static u_long	unpst_sendspace = PIPSIZ;
 static u_long	unpst_recvspace = PIPSIZ;
 static u_long	unpdg_maxdgram = 8*1024;	/* support 8KB syslog msgs */
 static u_long	unpdg_recvspace = 16*1024;
-static u_long	unpsp_sendspace = PIPSIZ;	/* really max datagram size */
 static u_long	unpsp_recvspace = PIPSIZ;
 
 static SYSCTL_NODE(_net, PF_LOCAL, local, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
@@ -171,16 +168,12 @@ static SYSCTL_NODE(_net_local, SOCK_SEQPACKET, seqpacket,
     CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "SOCK_SEQPACKET");
 
-SYSCTL_ULONG(_net_local_stream, OID_AUTO, sendspace, CTLFLAG_RW,
-	   &unpst_sendspace, 0, "Default stream send space.");
 SYSCTL_ULONG(_net_local_stream, OID_AUTO, recvspace, CTLFLAG_RW,
 	   &unpst_recvspace, 0, "Default stream receive space.");
 SYSCTL_ULONG(_net_local_dgram, OID_AUTO, maxdgram, CTLFLAG_RW,
 	   &unpdg_maxdgram, 0, "Maximum datagram size.");
 SYSCTL_ULONG(_net_local_dgram, OID_AUTO, recvspace, CTLFLAG_RW,
 	   &unpdg_recvspace, 0, "Default datagram receive space.");
-SYSCTL_ULONG(_net_local_seqpacket, OID_AUTO, maxseqpacket, CTLFLAG_RW,
-	   &unpsp_sendspace, 0, "Default seqpacket send space.");
 SYSCTL_ULONG(_net_local_seqpacket, OID_AUTO, recvspace, CTLFLAG_RW,
 	   &unpsp_recvspace, 0, "Default seqpacket receive space.");
 SYSCTL_INT(_net_local, OID_AUTO, inflight, CTLFLAG_RD, &unp_rights, 0,
@@ -447,8 +440,9 @@ uipc_attach(struct socket *so, int proto, struct thread *td)
 	if (so->so_snd.sb_hiwat == 0 || so->so_rcv.sb_hiwat == 0) {
 		switch (so->so_type) {
 		case SOCK_STREAM:
-			sendspace = unpst_sendspace;
+			sendspace = 0;
 			recvspace = unpst_recvspace;
+			STAILQ_INIT(&so->so_rcv.sb_mbq);
 			break;
 
 		case SOCK_DGRAM:
@@ -464,8 +458,9 @@ uipc_attach(struct socket *so, int proto, struct thread *td)
 			break;
 
 		case SOCK_SEQPACKET:
-			sendspace = unpsp_sendspace;
+			sendspace = 0;
 			recvspace = unpsp_recvspace;
+			STAILQ_INIT(&so->so_rcv.sb_mbq);
 			break;
 
 		default:
@@ -786,6 +781,10 @@ uipc_detach(struct socket *so)
 		taskqueue_enqueue_timeout(taskqueue_thread, &unp_gc_task, -1);
 
 	switch (so->so_type) {
+	case SOCK_STREAM:
+	case SOCK_SEQPACKET:
+		MPASS(STAILQ_EMPTY(&so->so_rcv.sb_mbq));
+		break;
 	case SOCK_DGRAM:
 		/*
 		 * Everything should have been unlinked/freed by unp_dispose()
@@ -841,6 +840,8 @@ uipc_listen(struct socket *so, int backlog, struct thread *td)
 	error = solisten_proto_check(so);
 	if (error == 0) {
 		cru2xt(td, &unp->unp_peercred);
+		(void)chgsbsize(so->so_cred->cr_uidinfo, &so->so_rcv.sb_hiwat,
+		    0, RLIM_INFINITY);
 		solisten_proto(so, backlog);
 	}
 	SOCK_UNLOCK(so);
@@ -874,187 +875,546 @@ uipc_peeraddr(struct socket *so, struct sockaddr *ret)
 	return (0);
 }
 
-static int
-uipc_rcvd(struct socket *so, int flags)
+/*
+ * pr_sosend() called with mbuf instead of uio is a kernel thread.  NFS,
+ * netgraph(4) and other subsystems can call into socket code.  The
+ * function will condition the mbuf so that it can be safely put onto socket
+ * buffer and calculate its char count and mbuf count.
+ *
+ * Note: we don't support receiving control data from a kernel thread.  Our
+ * pr_sosend methods have MPASS() to check that.  This may change.
+ */
+static void
+uipc_process_kernel_mbuf(struct mbuf *m, u_int *cc, u_int *mbcnt)
 {
-	struct unpcb *unp, *unp2;
-	struct socket *so2;
-	u_int mbcnt, sbcc;
 
-	unp = sotounpcb(so);
-	KASSERT(unp != NULL, ("%s: unp == NULL", __func__));
-	KASSERT(so->so_type == SOCK_STREAM || so->so_type == SOCK_SEQPACKET,
-	    ("%s: socktype %d", __func__, so->so_type));
+	M_ASSERTPKTHDR(m);
 
-	/*
-	 * Adjust backpressure on sender and wakeup any waiting to write.
-	 *
-	 * The unp lock is acquired to maintain the validity of the unp_conn
-	 * pointer; no lock on unp2 is required as unp2->unp_socket will be
-	 * static as long as we don't permit unp2 to disconnect from unp,
-	 * which is prevented by the lock on unp.  We cache values from
-	 * so_rcv to avoid holding the so_rcv lock over the entire
-	 * transaction on the remote so_snd.
-	 */
-	SOCKBUF_LOCK(&so->so_rcv);
-	mbcnt = so->so_rcv.sb_mbcnt;
-	sbcc = sbavail(&so->so_rcv);
-	SOCKBUF_UNLOCK(&so->so_rcv);
-	/*
-	 * There is a benign race condition at this point.  If we're planning to
-	 * clear SB_STOP, but uipc_send is called on the connected socket at
-	 * this instant, it might add data to the sockbuf and set SB_STOP.  Then
-	 * we would erroneously clear SB_STOP below, even though the sockbuf is
-	 * full.  The race is benign because the only ill effect is to allow the
-	 * sockbuf to exceed its size limit, and the size limits are not
-	 * strictly guaranteed anyway.
-	 */
-	UNP_PCB_LOCK(unp);
-	unp2 = unp->unp_conn;
-	if (unp2 == NULL) {
-		UNP_PCB_UNLOCK(unp);
-		return (0);
+	m_clrprotoflags(m);
+	m_tag_delete_chain(m, NULL);
+	m->m_pkthdr.rcvif = NULL;
+	m->m_pkthdr.flowid = 0;
+	m->m_pkthdr.csum_flags = 0;
+	m->m_pkthdr.fibnum = 0;
+	m->m_pkthdr.rsstype = 0;
+
+	*cc = m->m_pkthdr.len;
+	*mbcnt = MSIZE;
+	for (struct mbuf *mb = m; mb != NULL; mb = mb->m_next) {
+		*mbcnt += MSIZE;
+		if (mb->m_flags & M_EXT)
+			*mbcnt += mb->m_ext.ext_size;
 	}
-	so2 = unp2->unp_socket;
-	SOCKBUF_LOCK(&so2->so_snd);
-	if (sbcc < so2->so_snd.sb_hiwat && mbcnt < so2->so_snd.sb_mbmax)
-		so2->so_snd.sb_flags &= ~SB_STOP;
-	sowwakeup_locked(so2);
-	UNP_PCB_UNLOCK(unp);
-	return (0);
 }
 
+#ifdef INVARIANTS
+static inline void
+uipc_stream_sbcheck(struct sockbuf *sb)
+{
+	struct mbuf *d;
+	u_int dcc, dctl;
+
+	dcc = dctl = 0;
+	STAILQ_FOREACH(d, &sb->sb_mbq, m_stailq) {
+		if (d->m_type == MT_CONTROL)
+			dctl += d->m_len;
+		else if (d->m_type == MT_DATA)
+			dcc +=  d->m_len;
+		else
+			MPASS(0);
+		if (d->m_stailq.stqe_next == NULL)
+			MPASS(sb->sb_mbq.stqh_last == &d->m_stailq.stqe_next);
+	}
+	MPASS(dcc == sb->sb_acc);
+	MPASS(dcc == sb->sb_ccc);
+	MPASS(dctl == sb->sb_ctl);
+}
+#define	UIPC_STREAM_SBCHECK(sb)	uipc_stream_sbcheck(sb)
+#else
+#define	UIPC_STREAM_SBCHECK(sb)	do {} while (0)
+#endif
+
 static int
-uipc_send(struct socket *so, int flags, struct mbuf *m, struct sockaddr *nam,
-    struct mbuf *control, struct thread *td)
+uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
+    struct uio *uio, struct mbuf *m, struct mbuf *c, int flags,
+    struct thread *td)
 {
 	struct unpcb *unp, *unp2;
 	struct socket *so2;
-	u_int mbcnt, sbcc;
+	struct sockbuf *sb;
+	struct mbuf *mlast, *clast;
+	u_int cc, ctl, mbcnt;
+	bool nonblock, eor;
 	int error;
 
-	unp = sotounpcb(so);
-	KASSERT(unp != NULL, ("%s: unp == NULL", __func__));
-	KASSERT(so->so_type == SOCK_STREAM || so->so_type == SOCK_SEQPACKET,
-	    ("%s: socktype %d", __func__, so->so_type));
+	MPASS((uio != NULL && m == NULL) || (m != NULL && uio == NULL));
+	MPASS(m == NULL || c == NULL);
 
-	error = 0;
-	if (flags & PRUS_OOB) {
+	if (__predict_false(flags & MSG_OOB)) {
 		error = EOPNOTSUPP;
-		goto release;
+		goto out;
 	}
-	if (control != NULL &&
-	    (error = unp_internalize(&control, td, NULL, NULL, NULL)))
-		goto release;
 
-	unp2 = NULL;
-	if ((so->so_state & SS_ISCONNECTED) == 0) {
-		if (nam != NULL) {
-			if ((error = unp_connect(so, nam, td)) != 0)
-				goto out;
-		} else {
-			error = ENOTCONN;
+	nonblock = (so->so_state & SS_NBIO) ||
+	    (flags & (MSG_DONTWAIT | MSG_NBIO));
+	eor = flags & MSG_EOR;
+	ctl = 0;
+
+	if (m == NULL) {
+		ssize_t resid;
+
+		if (c != NULL &&
+		    (error = unp_internalize(&c, td, &clast, &ctl, &mbcnt)))
 			goto out;
+
+		resid = uio->uio_resid;
+		m = m_uiotombuf(uio, M_WAITOK, 0, 0, 0);
+		if (__predict_false(m == NULL)) {
+			error = EFAULT;
+			goto out2;
 		}
+		uio->uio_resid = resid;
+		/*
+		 * XXXGL: m_uiotombuf() can't return us mbcnt w/o M_PKTHDR.
+		 * Neither works on chains. It also will allocate zero length
+		 * mbuf for empty uio. Should be improved.
+		 */
+		if (__predict_false(m->m_len == 0)) {
+			MPASS(resid == 0);
+			MPASS(m->m_next == 0);
+			m_free(m);
+			m = NULL;
+			mlast = clast;
+		}
+		cc = mbcnt = 0;
+		for (struct mbuf *mb = m; mb != NULL; mb = mb->m_next) {
+			cc += mb->m_len;
+			mbcnt += MSIZE;
+			if (mb->m_flags & M_EXT)
+				mbcnt += mb->m_ext.ext_size;
+			if (mb->m_next == NULL) {
+				mlast = mb;
+				if (eor)
+					mb->m_flags |= M_EOR;
+			}
+		}
+	} else
+		uipc_process_kernel_mbuf(m, &cc, &mbcnt);
+
+	/* XXXGL: see comment in uipc_sosend_dgram(). We are really close
+	 * to stop using send buffer lock at all for unix(4)! */
+	error = SOCK_IO_SEND_LOCK(so, SBLOCKWAIT(flags));
+	if (error)
+		goto out2;
+	SOCK_SENDBUF_LOCK(so);
+	if (so->so_snd.sb_state & SBS_CANTSENDMORE) {
+		SOCK_SENDBUF_UNLOCK(so);
+		error = EPIPE;
+		goto out3;
+	}
+	if (so->so_error != 0) {
+		error = so->so_error;
+		so->so_error = 0;
+		SOCK_SENDBUF_UNLOCK(so);
+		goto out3;
+	}
+	if ((so->so_state & SS_ISCONNECTED) == 0) {
+		SOCK_SENDBUF_UNLOCK(so);
+		error = ENOTCONN;
+		goto out3;
+	}
+	SOCK_SENDBUF_UNLOCK(so);
+
+	unp = sotounpcb(so);
+	UNP_PCB_LOCK(unp);
+	unp2 = unp_pcb_lock_peer(unp);
+	UNP_PCB_UNLOCK(unp);
+	if (unp2 == NULL) {
+		error = ENOTCONN;
+		goto out3;
 	}
 
-	UNP_PCB_LOCK(unp);
-	if ((unp2 = unp_pcb_lock_peer(unp)) == NULL) {
-		UNP_PCB_UNLOCK(unp);
-		error = ENOTCONN;
-		goto out;
-	} else if (so->so_snd.sb_state & SBS_CANTSENDMORE) {
-		unp_pcb_unlock_pair(unp, unp2);
-		error = EPIPE;
-		goto out;
-	}
-	UNP_PCB_UNLOCK(unp);
-	if ((so2 = unp2->unp_socket) == NULL) {
-		UNP_PCB_UNLOCK(unp2);
-		error = ENOTCONN;
-		goto out;
-	}
-	SOCKBUF_LOCK(&so2->so_rcv);
 	if (unp2->unp_flags & UNP_WANTCRED_MASK) {
 		/*
 		 * Credentials are passed only once on SOCK_STREAM and
 		 * SOCK_SEQPACKET (LOCAL_CREDS => WANTCRED_ONESHOT), or
 		 * forever (LOCAL_CREDS_PERSISTENT => WANTCRED_ALWAYS).
 		 */
-		control = unp_addsockcred(td, control, unp2->unp_flags, NULL,
-		    NULL, NULL);
+		c = unp_addsockcred(td, c, unp2->unp_flags, &clast, &ctl,
+		    &mbcnt);
 		unp2->unp_flags &= ~UNP_WANTCRED_ONESHOT;
 	}
-
-	/*
-	 * Send to paired receive port and wake up readers.  Don't
-	 * check for space available in the receive buffer if we're
-	 * attaching ancillary data; Unix domain sockets only check
-	 * for space in the sending sockbuf, and that check is
-	 * performed one level up the stack.  At that level we cannot
-	 * precisely account for the amount of buffer space used
-	 * (e.g., because control messages are not yet internalized).
-	 */
-	switch (so->so_type) {
-	case SOCK_STREAM:
-		if (control != NULL) {
-			sbappendcontrol_locked(&so2->so_rcv,
-			    m->m_len > 0 ?  m : NULL, control, flags);
-			control = NULL;
-		} else
-			sbappend_locked(&so2->so_rcv, m, flags);
-		break;
-
-	case SOCK_SEQPACKET:
-		if (sbappendaddr_nospacecheck_locked(&so2->so_rcv,
-		    &sun_noname, m, control))
-			control = NULL;
-		break;
-	}
-
-	mbcnt = so2->so_rcv.sb_mbcnt;
-	sbcc = sbavail(&so2->so_rcv);
-	if (sbcc)
-		sorwakeup_locked(so2);
-	else
-		SOCKBUF_UNLOCK(&so2->so_rcv);
-
-	/*
-	 * The PCB lock on unp2 protects the SB_STOP flag.  Without it,
-	 * it would be possible for uipc_rcvd to be called at this
-	 * point, drain the receiving sockbuf, clear SB_STOP, and then
-	 * we would set SB_STOP below.  That could lead to an empty
-	 * sockbuf having SB_STOP set
-	 */
-	SOCKBUF_LOCK(&so->so_snd);
-	if (sbcc >= so->so_snd.sb_hiwat || mbcnt >= so->so_snd.sb_mbmax)
-		so->so_snd.sb_flags |= SB_STOP;
-	SOCKBUF_UNLOCK(&so->so_snd);
 	UNP_PCB_UNLOCK(unp2);
-	m = NULL;
-out:
-	/*
-	 * PRUS_EOF is equivalent to pr_send followed by pr_shutdown.
-	 */
-	if (flags & PRUS_EOF) {
-		UNP_PCB_LOCK(unp);
-		socantsendmore(so);
-		unp_shutdown(unp);
-		UNP_PCB_UNLOCK(unp);
-	}
-	if (control != NULL && error != 0)
-		unp_scan(control, unp_freerights);
 
-release:
-	if (control != NULL)
-		m_freem(control);
 	/*
-	 * In case of PRUS_NOTREADY, uipc_ready() is responsible
-	 * for freeing memory.
-	 */   
-	if (m != NULL && (flags & PRUS_NOTREADY) == 0)
+	 * Wait on the peer socket receive buffer until we have enough space
+	 * to put at least control.  The data is a stream and can be put
+	 * partially, but control is really a datagram.
+	 */
+	so2 = unp2->unp_socket;
+	MPASS(so2);
+	sb = &so2->so_rcv;
+	while (ctl + cc > 0) {
+		struct mbuf *mtail, *mnext;
+		u_int space;
+
+		mnext = NULL;
+		mtail = mlast;
+
+		SOCK_RECVBUF_LOCK(so2);
+restart:
+		UIPC_STREAM_SBCHECK(sb);
+		if (__predict_false(ctl > sb->sb_hiwat)) {
+			SOCK_RECVBUF_UNLOCK(so2);
+			error = EMSGSIZE;
+			goto out3;
+		};
+		if (__predict_false(sb->sb_state & SBS_CANTRCVMORE)) {
+			SOCK_RECVBUF_UNLOCK(so2);
+			error = EPIPE;
+			goto out3;
+		}
+		MPASS(sb->sb_hiwat >= sb->sb_acc + sb->sb_ctl);
+		space = sb->sb_hiwat - sb->sb_acc - sb->sb_ctl;
+		if (space < sb->sb_lowat || space < ctl) {
+			if (nonblock) {
+				SOCK_RECVBUF_UNLOCK(so2);
+				error = EWOULDBLOCK;
+				goto out3;
+			}
+			if ((error = sbwait(so2, SO_RCV)) != 0) {
+				SOCK_RECVBUF_UNLOCK(so2);
+				goto out3;
+			} else
+				goto restart;
+		}
+		MPASS(space >= ctl);
+		space -= ctl;
+		if (space == 0) {
+			/* There is space only to send control. */
+			MPASS(c != NULL);
+			mnext = m;
+			m = NULL;
+		} else if (space < cc) {
+			/* Not enough space. */
+			mnext = m_split(m, space, M_NOWAIT);
+			if (__predict_false(mnext == NULL)) {
+				struct mbuf *mt;
+
+				/*
+				 * If allocation failed use M_WAITOK and merge
+				 * the chain back.  Next time m_split() will
+				 * easily split at the same place.  Only if we
+				 * race with setsockopt(SO_RCVBUF) shrinking
+				 * sb_hiwat, this can happen more than a time.
+				 * XXXGL: make m_split() work with chains.
+				 */
+				SOCK_RECVBUF_UNLOCK(so2);
+				printf("going with M_WAITOK\n");
+				mnext = m_split(m, space, M_WAITOK);
+				for (mt = m; mt->m_next != NULL;
+				    mt = mt->m_next)
+					;
+				mt->m_next = mnext;
+				SOCK_RECVBUF_LOCK(so2);
+				goto restart;
+			}
+			/* XXXGL: make m_split operate on chains. */
+			for (mtail = m; mtail->m_next != NULL;
+			    mtail = mtail->m_next)
+				;
+			for (mlast = mnext; mlast->m_next != NULL;
+			    mlast = mlast->m_next)
+				;
+			MPASS(mtail != mlast);
+			sb->sb_acc += space;
+			sb->sb_ccc += space;
+			uio->uio_resid -= space;
+			cc -= space;
+		} else {
+			/* Enough space. */
+			sb->sb_acc += cc;
+			sb->sb_ccc += cc;
+			uio->uio_resid -= cc;
+			cc = 0;
+		}
+		if (c != NULL) {
+			clast->m_next = m;
+			m = c;
+			c = NULL;
+			sb->sb_ctl += ctl;
+			ctl = 0;
+		}
+		MPASS(m);
+		/* XXXGL: create STAILQ_APPEND */
+		*sb->sb_mbq.stqh_last = m;
+		sb->sb_mbq.stqh_last = &mtail->m_stailq.stqe_next;
+		UIPC_STREAM_SBCHECK(sb);
+		sorwakeup_locked(so2);
+		m = mnext;
+	}
+
+	MPASS(m == NULL);
+
+	td->td_ru.ru_msgsnd++;
+
+out3:
+	SOCK_IO_SEND_UNLOCK(so);
+out2:
+	if (c)
+		unp_scan(c, unp_freerights);
+out:
+	if (m != NULL)
 		m_freem(m);
+	if (c != NULL)
+		m_freem(c);
+
 	return (error);
+}
+
+static int
+uipc_soreceive_stream_or_seqpacket(struct socket *so, struct sockaddr **psa,
+    struct uio *uio, struct mbuf **mp0, struct mbuf **controlp, int *flagsp)
+{
+	struct sockbuf *sb = &so->so_rcv;
+	struct mbuf *control, *m, *first, *last, *next;
+	u_int ctl, space, datalen, lastlen;
+	int error, flags;
+	bool nonblock, waitall, peek;
+
+	MPASS(mp0 == NULL);
+
+	if (psa != NULL)
+		*psa = NULL;
+	if (controlp != NULL)
+		*controlp = NULL;
+
+	flags = flagsp != NULL ? *flagsp : 0;
+	nonblock = (so->so_state & SS_NBIO) ||
+	    (flags & (MSG_DONTWAIT | MSG_NBIO));
+	peek = flags & MSG_PEEK;
+	waitall = (flags & MSG_WAITALL) && !peek;
+
+	if (__predict_false((so->so_state &
+	    (SS_ISCONNECTED|SS_ISDISCONNECTED)) == 0))
+		return (ENOTCONN);
+
+	error = SOCK_IO_RECV_LOCK(so, SBLOCKWAIT(flags));
+	if (__predict_false(error))
+		return (error);
+
+restart:
+	SOCK_RECVBUF_LOCK(so);
+	UIPC_STREAM_SBCHECK(sb);
+	while (sb->sb_acc < sb->sb_lowat &&
+	      (sb->sb_ctl == 0 || controlp == NULL)) {
+		if (so->so_error) {
+			error = so->so_error;
+			if (!peek)
+				so->so_error = 0;
+			SOCK_RECVBUF_UNLOCK(so);
+			SOCK_IO_RECV_UNLOCK(so);
+			return (error);
+		}
+		if (sb->sb_state & SBS_CANTRCVMORE) {
+			SOCK_RECVBUF_UNLOCK(so);
+			SOCK_IO_RECV_UNLOCK(so);
+			return (0);
+		}
+		if (nonblock) {
+			SOCK_RECVBUF_UNLOCK(so);
+			SOCK_IO_RECV_UNLOCK(so);
+			return (EWOULDBLOCK);
+		}
+		error = sbwait(so, SO_RCV);
+		if (error) {
+			SOCK_RECVBUF_UNLOCK(so);
+			SOCK_IO_RECV_UNLOCK(so);
+			return (error);
+		}
+	}
+
+	MPASS(STAILQ_FIRST(&sb->sb_mbq));
+	MPASS(sb->sb_acc > 0 || sb->sb_ctl > 0);
+
+	ctl = 0;
+	first = STAILQ_FIRST(&sb->sb_mbq);
+	if (first->m_type == MT_CONTROL) {
+		control = first;
+		STAILQ_FOREACH_FROM(first, &sb->sb_mbq, m_stailq) {
+			if (first->m_type != MT_CONTROL)
+				break;
+			ctl += first->m_len;
+		}
+	} else
+		control = NULL;
+
+	/*
+	 * Find split point for the next copyout.  On exit from the cycle:
+	 * last == NULL - socket to be flushed
+	 * last != NULL
+	 *   lastlen > last->m_len - uio to be filled, last to be adjusted
+	 *   lastlen == 0          - MT_CONTROL or M_EOR encountered
+	 */
+	space = uio->uio_resid;
+	datalen = 0;
+	for (m = first, last = NULL; m != NULL; m = STAILQ_NEXT(m, m_stailq)) {
+		if (m->m_type != MT_DATA) {
+			last = m;
+			lastlen = 0;
+			break;
+		}
+		if (space >= m->m_len) {
+			space -= m->m_len;
+			datalen += m->m_len;
+			if (m->m_flags & M_EOR) {
+				last = STAILQ_NEXT(m, m_stailq);
+				lastlen = 0;
+				flags |= MSG_EOR;
+				break;
+			}
+		} else {
+			datalen += space;
+			last = m;
+			lastlen = space;
+			break;
+		}
+	}
+
+	UIPC_STREAM_SBCHECK(sb);
+	if (!peek) {
+		if (last == NULL)
+			STAILQ_INIT(&sb->sb_mbq);
+		else {
+			STAILQ_FIRST(&sb->sb_mbq) = last;
+			MPASS(last->m_len > lastlen);
+			last->m_len -= lastlen;
+			last->m_data += lastlen;
+		}
+		MPASS(sb->sb_acc >= datalen);
+		sb->sb_acc -= datalen;
+		sb->sb_ccc -= datalen;
+		MPASS(sb->sb_ctl >= ctl);
+		sb->sb_ctl -= ctl;
+		UIPC_STREAM_SBCHECK(sb);
+		/* Mind the name.  We are waking writer here, not reader. */
+		sorwakeup_locked(so);
+	} else
+		SOCK_RECVBUF_UNLOCK(so);
+
+	while (control != NULL && control->m_type == MT_CONTROL) {
+		if (!peek) {
+			struct mbuf *c;
+
+			/*
+			 * unp_externalize() failure must abort entire read(2).
+			 * Such failure should also free the problematic
+			 * control, so that socket is not left in a state
+			 * where it can't progress forward with reading.
+			 * Probability of such a failure is really low, so it
+			 * is fine that we need to perform pretty complex
+			 * operation here to reconstruct of the buffer.  This
+			 * should be safe as we own top of the queue due to the
+			 * sx(9) lock, but we need check if we raced with
+			 * shutdown(2).
+			 * XXXGL: unp_externalize() used to be
+			 * dom_externalize() KBI and it frees whole chain, so
+			 * we need to feed it with mbufs one by one.
+			 */
+			c = control;
+			control = STAILQ_NEXT(c, m_stailq);
+			STAILQ_NEXT(c, m_stailq) = NULL;
+			error = unp_externalize(c, controlp, flags);
+			if (__predict_false(error)) {
+				SOCK_RECVBUF_LOCK(so);
+				UIPC_STREAM_SBCHECK(sb);
+				if (__predict_false(sb->sb_state &
+				    SBS_CANTRCVMORE)) {
+					unp_scan(control, unp_freerights);
+					m_freem(control);
+				} else {
+					/* XXXGL: STAILQ_PREPEND */
+					if (STAILQ_EMPTY(&sb->sb_mbq))
+						STAILQ_INSERT_HEAD(&sb->sb_mbq,
+						    control, m_stailq);
+					else
+						STAILQ_FIRST(&sb->sb_mbq) =
+						    control;
+					sb->sb_ctl = 0;
+					STAILQ_FOREACH(c, &sb->sb_mbq, m_stailq)
+						if (c->m_type == MT_CONTROL)
+							sb->sb_ctl += c->m_len;
+					sb->sb_acc += datalen;
+					sb->sb_ccc += datalen;
+				}
+				UIPC_STREAM_SBCHECK(sb);
+				SOCK_RECVBUF_UNLOCK(so);
+				SOCK_IO_RECV_UNLOCK(so);
+				return (error);
+			}
+			if (controlp != NULL) {
+				while (*controlp != NULL)
+					controlp = &(*controlp)->m_next;
+			}
+		} else {
+			/*
+			 * XXXGL
+			 *
+			 * In MSG_PEEK case control is not externalized.  This
+			 * means we are leaking some kernel pointers to the
+			 * userland.  They are useless to a law-abiding
+			 * application, but may be useful to a malware.  This
+			 * is what the historical implementation in the
+			 * soreceive_generic() did. To be improved?
+			 */
+			if (controlp != NULL) {
+				*controlp = m_copym(control, 0, control->m_len,
+				    M_WAITOK);
+				controlp = &(*controlp)->m_next;
+			}
+			control = STAILQ_NEXT(control, m_stailq);
+		}
+	}
+
+	for (m = first; m != last; m = next) {
+		next = STAILQ_NEXT(m, m_stailq);
+		error = uiomove(mtod(m, char *), m->m_len, uio);
+		if (__predict_false(error)) {
+			SOCK_IO_RECV_UNLOCK(so);
+			if (!peek)
+				for (;m != last; m = next) {
+					next = STAILQ_NEXT(m, m_stailq);
+					m_free(m);
+				}
+			return (error);
+		}
+		if (!peek)
+			m_free(m);
+	}
+	if (last != NULL && lastlen > 0) {
+		if (!peek) {
+			MPASS(!(m->m_flags & M_PKTHDR));
+			MPASS(last->m_data - (last->m_flags & M_EXT ?
+			    last->m_ext.ext_buf : last->m_dat) >= lastlen);
+			error = uiomove(mtod(last, char *) - lastlen,
+			    lastlen, uio);
+		} else
+			error = uiomove(mtod(last, char *), lastlen, uio);
+		if (__predict_false(error)) {
+			SOCK_IO_RECV_UNLOCK(so);
+			return (error);
+		}
+	}
+	if (waitall && !(flags & MSG_EOR) && uio->uio_resid > 0)
+		goto restart;
+	SOCK_IO_RECV_UNLOCK(so);
+
+	if (flagsp != NULL)
+		*flagsp |= flags;
+
+	uio->uio_td->td_ru.ru_msgrcv++;
+
+	return (0);
 }
 
 /* PF_UNIX/SOCK_DGRAM version of sbspace() */
@@ -1132,12 +1492,7 @@ uipc_sosend_dgram(struct socket *so, struct sockaddr *addr, struct uio *uio,
 		    (error = unp_internalize(&c, td, &clast, &ctl, &mbcnt)))
 			goto out;
 	} else {
-		/* pr_sosend() with mbuf usually is a kernel thread. */
-
-		M_ASSERTPKTHDR(m);
-		if (__predict_false(c != NULL))
-			panic("%s: control from a kernel thread", __func__);
-
+		uipc_process_kernel_mbuf(m, &cc, &mbcnt);
 		if (__predict_false(m->m_pkthdr.len > unpdg_maxdgram)) {
 			error = EMSGSIZE;
 			goto out;
@@ -1145,22 +1500,6 @@ uipc_sosend_dgram(struct socket *so, struct sockaddr *addr, struct uio *uio,
 		if ((f = m_gethdr(M_NOWAIT, MT_SONAME)) == NULL) {
 			error = ENOBUFS;
 			goto out;
-		}
-		/* Condition the foreign mbuf to our standards. */
-		m_clrprotoflags(m);
-		m_tag_delete_chain(m, NULL);
-		m->m_pkthdr.rcvif = NULL;
-		m->m_pkthdr.flowid = 0;
-		m->m_pkthdr.csum_flags = 0;
-		m->m_pkthdr.fibnum = 0;
-		m->m_pkthdr.rsstype = 0;
-
-		cc = m->m_pkthdr.len;
-		mbcnt = MSIZE;
-		for (struct mbuf *mb = m; mb != NULL; mb = mb->m_next) {
-			mbcnt += MSIZE;
-			if (mb->m_flags & M_EXT)
-				mbcnt += mb->m_ext.ext_size;
 		}
 	}
 
@@ -2086,6 +2425,20 @@ unp_connect2(struct socket *so, struct socket *so2)
 }
 
 static void
+unp_soisdisconnected(struct socket *so)
+{
+
+	SOCK_LOCK(so);
+	MPASS(!SOLISTENING(so));
+	so->so_state |= SS_ISDISCONNECTED;
+	so->so_state &= ~SS_ISCONNECTED;
+	SOCK_RECVBUF_LOCK(so);
+	socantrcvmore_locked(so);
+	SOCK_UNLOCK(so);
+	wakeup(&so->so_timeo);	/* XXXGL: is this needed? */
+}
+
+static void
 unp_disconnect(struct unpcb *unp, struct unpcb *unp2)
 {
 	struct socket *so, *so2;
@@ -2157,12 +2510,10 @@ unp_disconnect(struct unpcb *unp, struct unpcb *unp2)
 
 	case SOCK_STREAM:
 	case SOCK_SEQPACKET:
-		if (so)
-			soisdisconnected(so);
+		unp_soisdisconnected(so);
 		MPASS(unp2->unp_conn == unp);
 		unp2->unp_conn = NULL;
-		if (so2)
-			soisdisconnected(so2);
+		unp_soisdisconnected(so2);
 		break;
 	}
 
@@ -3021,7 +3372,7 @@ unp_scan_socket(struct socket *so, void (*op)(struct filedescent **, int))
 		break;
 	case SOCK_STREAM:
 	case SOCK_SEQPACKET:
-		unp_scan(so->so_rcv.sb_mb, op);
+		unp_scan(STAILQ_FIRST(&so->so_rcv.sb_mbq), op);
 		break;
 	}
 	SOCK_RECVBUF_UNLOCK(so);
@@ -3231,39 +3582,33 @@ unp_dispose(struct socket *so)
 		}
 		m = STAILQ_FIRST(&sb->uxdg_mb);
 		STAILQ_INIT(&sb->uxdg_mb);
-		/* XXX: our shortened sbrelease() */
-		(void)chgsbsize(so->so_cred->cr_uidinfo, &sb->sb_hiwat, 0,
-		    RLIM_INFINITY);
-		/*
-		 * XXXGL Mark sb with SBS_CANTRCVMORE.  This is needed to
-		 * prevent uipc_sosend_dgram() or unp_disconnect() adding more
-		 * data to the socket.
-		 * We came here either through shutdown(2) or from the final
-		 * sofree().  The sofree() case is simple as it guarantees
-		 * that no more sends will happen, however we can race with
-		 * unp_disconnect() from our peer.  The shutdown(2) case is
-		 * more exotic.  It would call into unp_dispose() only if
-		 * socket is SS_ISCONNECTED.  This is possible if we did
-		 * connect(2) on this socket and we also had it bound with
-		 * bind(2) and receive connections from other sockets.
-		 * Because uipc_shutdown() violates POSIX (see comment
-		 * there) we will end up here shutting down our receive side.
-		 * Of course this will have affect not only on the peer we
-		 * connect(2)ed to, but also on all of the peers who had
-		 * connect(2)ed to us.  Their sends would end up with ENOBUFS.
-		 */
-		sb->sb_state |= SBS_CANTRCVMORE;
 		break;
 	case SOCK_STREAM:
 	case SOCK_SEQPACKET:
 		sb = &so->so_rcv;
-		m = sbcut_locked(sb, sb->sb_ccc);
-		KASSERT(sb->sb_ccc == 0 && sb->sb_mb == 0 && sb->sb_mbcnt == 0,
-		    ("%s: ccc %u mb %p mbcnt %u", __func__,
-		    sb->sb_ccc, (void *)sb->sb_mb, sb->sb_mbcnt));
-		sbrelease_locked(so, SO_RCV);
+		m = STAILQ_FIRST(&sb->sb_mbq);
+		STAILQ_FIRST(&sb->sb_mbq) = NULL;
 		break;
 	}
+	/*
+	 * Mark sb with SBS_CANTRCVMORE.  This is needed to prevent
+	 * uipc_sosend_*() or unp_disconnect() adding more data to the socket.
+	 * We came here either through shutdown(2) or from the final sofree().
+	 * The sofree() case is simple as it guarantees that no more sends will
+	 * happen, however we can race with unp_disconnect() from our peer.
+	 * The shutdown(2) case is more exotic.  It would call into
+	 * unp_dispose() only if socket is SS_ISCONNECTED.  This is possible if
+	 * we did connect(2) on this socket and we also had it bound with
+	 * bind(2) and receive connections from other sockets.  Because
+	 * uipc_shutdown() violates POSIX (see comment there) this applies to
+	 * SOCK_DGRAM as well.  For SOCK_DGRAM this SBS_CANTRCVMORE will have
+	 * affect not only on the peer we connect(2)ed to, but also on all of
+	 * the peers who had connect(2)ed to us.  Their sends would end up
+	 * with ENOBUFS.
+	 */
+	sb->sb_state |= SBS_CANTRCVMORE;
+	(void)chgsbsize(so->so_cred->cr_uidinfo, &sb->sb_hiwat, 0,
+	    RLIM_INFINITY);
 	SOCK_RECVBUF_UNLOCK(so);
 	SOCK_IO_RECV_UNLOCK(so);
 
@@ -3322,7 +3667,7 @@ unp_scan(struct mbuf *m0, void (*op)(struct filedescent **, int))
  */
 static struct protosw streamproto = {
 	.pr_type =		SOCK_STREAM,
-	.pr_flags =		PR_CONNREQUIRED | PR_WANTRCVD | PR_CAPATTACH,
+	.pr_flags =		PR_CONNREQUIRED | PR_CAPATTACH | PR_SOCKBUF,
 	.pr_ctloutput =		&uipc_ctloutput,
 	.pr_abort = 		uipc_abort,
 	.pr_accept =		uipc_peeraddr,
@@ -3336,13 +3681,12 @@ static struct protosw streamproto = {
 	.pr_disconnect =	uipc_disconnect,
 	.pr_listen =		uipc_listen,
 	.pr_peeraddr =		uipc_peeraddr,
-	.pr_rcvd =		uipc_rcvd,
-	.pr_send =		uipc_send,
 	.pr_ready =		uipc_ready,
 	.pr_sense =		uipc_sense,
 	.pr_shutdown =		uipc_shutdown,
 	.pr_sockaddr =		uipc_sockaddr,
-	.pr_soreceive =		soreceive_generic,
+	.pr_sosend = 		uipc_sosend_stream_or_seqpacket,
+	.pr_soreceive =		uipc_soreceive_stream_or_seqpacket,
 	.pr_close =		uipc_close,
 };
 
@@ -3371,13 +3715,7 @@ static struct protosw dgramproto = {
 
 static struct protosw seqpacketproto = {
 	.pr_type =		SOCK_SEQPACKET,
-	/*
-	 * XXXRW: For now, PR_ADDR because soreceive will bump into them
-	 * due to our use of sbappendaddr.  A new sbappend variants is needed
-	 * that supports both atomic record writes and control data.
-	 */
-	.pr_flags =		PR_ADDR | PR_ATOMIC | PR_CONNREQUIRED |
-				PR_WANTRCVD | PR_CAPATTACH,
+	.pr_flags =		PR_CONNREQUIRED | PR_CAPATTACH | PR_SOCKBUF,
 	.pr_ctloutput =		&uipc_ctloutput,
 	.pr_abort =		uipc_abort,
 	.pr_accept =		uipc_peeraddr,
@@ -3391,12 +3729,11 @@ static struct protosw seqpacketproto = {
 	.pr_disconnect =	uipc_disconnect,
 	.pr_listen =		uipc_listen,
 	.pr_peeraddr =		uipc_peeraddr,
-	.pr_rcvd =		uipc_rcvd,
-	.pr_send =		uipc_send,
 	.pr_sense =		uipc_sense,
 	.pr_shutdown =		uipc_shutdown,
 	.pr_sockaddr =		uipc_sockaddr,
-	.pr_soreceive =		soreceive_generic,	/* XXX: or...? */
+	.pr_sosend = 		uipc_sosend_stream_or_seqpacket,
+	.pr_soreceive =		uipc_soreceive_stream_or_seqpacket,
 	.pr_close =		uipc_close,
 };
 
