@@ -269,7 +269,7 @@ recvfd(int sockfd, int *recv_fd, int flags)
 }
 
 #if TEST_PROTO == SOCK_STREAM
-#define	LOCAL_SENDSPACE_SYSCTL	"net.local.stream.sendspace"
+#define	LOCAL_SENDSPACE_SYSCTL	"net.local.stream.recvspace"
 #define	LOCAL_RECVSPACE_SYSCTL	"net.local.stream.recvspace"
 #elif TEST_PROTO == SOCK_DGRAM
 #define	LOCAL_SENDSPACE_SYSCTL	"net.local.dgram.maxdgram"
