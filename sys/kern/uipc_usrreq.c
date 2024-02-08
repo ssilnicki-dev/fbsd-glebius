@@ -293,13 +293,12 @@ static void	unp_gc(__unused void *, int);
 static void	unp_scan(struct mbuf *, void (*)(struct filedescent **, int));
 static void	unp_discard(struct file *);
 static void	unp_freerights(struct filedescent **, int);
-static int	unp_internalize(struct mbuf **, struct thread *,
-		    struct mbuf **, u_int *, u_int *);
+static int	unp_internalize(struct mbuf *, struct mchain *,
+		    struct thread *);
 static void	unp_internalize_fp(struct file *);
 static int	unp_externalize(struct mbuf *, struct mbuf **, int);
 static int	unp_externalize_fp(struct file *);
-static struct mbuf	*unp_addsockcred(struct thread *, struct mbuf *,
-		    int, struct mbuf **, u_int *, u_int *);
+static void	unp_addsockcred(struct thread *, struct mchain *, int);
 static void	unp_process_defers(void * __unused, int);
 
 static void
@@ -885,7 +884,7 @@ uipc_peeraddr(struct socket *so, struct sockaddr *ret)
  * pr_sosend methods have MPASS() to check that.  This may change.
  */
 static void
-uipc_process_kernel_mbuf(struct mbuf *m, u_int *cc, u_int *mbcnt)
+uipc_process_kernel_mbuf(struct mbuf *m, struct mchain *mc)
 {
 
 	M_ASSERTPKTHDR(m);
@@ -898,13 +897,8 @@ uipc_process_kernel_mbuf(struct mbuf *m, u_int *cc, u_int *mbcnt)
 	m->m_pkthdr.fibnum = 0;
 	m->m_pkthdr.rsstype = 0;
 
-	*cc = m->m_pkthdr.len;
-	*mbcnt = MSIZE;
-	for (struct mbuf *mb = m; mb != NULL; mb = mb->m_next) {
-		*mbcnt += MSIZE;
-		if (mb->m_flags & M_EXT)
-			*mbcnt += mb->m_ext.ext_size;
-	}
+	mc_init_m(mc, m);
+	MPASS(m->m_pkthdr.len == mc->mc_len);
 }
 
 #ifdef INVARIANTS
@@ -942,8 +936,7 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 	struct unpcb *unp, *unp2;
 	struct socket *so2;
 	struct sockbuf *sb;
-	struct mbuf *mlast, *clast;
-	u_int cc, ctl, mbcnt;
+	struct mchain mc, cmc;
 	bool nonblock, eor;
 	int error;
 
@@ -958,13 +951,14 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 	nonblock = (so->so_state & SS_NBIO) ||
 	    (flags & (MSG_DONTWAIT | MSG_NBIO));
 	eor = flags & MSG_EOR;
-	ctl = 0;
+
+	mc = MCHAIN_INITIALIZER(&mc);
+	cmc = MCHAIN_INITIALIZER(&cmc);
 
 	if (m == NULL) {
 		ssize_t resid;
 
-		if (c != NULL &&
-		    (error = unp_internalize(&c, td, &clast, &ctl, &mbcnt)))
+		if (c != NULL && (error = unp_internalize(c, &cmc, td)))
 			goto out;
 
 		resid = uio->uio_resid;
@@ -983,23 +977,14 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 			MPASS(resid == 0);
 			MPASS(m->m_next == 0);
 			m_free(m);
-			m = NULL;
-			mlast = clast;
-		}
-		cc = mbcnt = 0;
-		for (struct mbuf *mb = m; mb != NULL; mb = mb->m_next) {
-			cc += mb->m_len;
-			mbcnt += MSIZE;
-			if (mb->m_flags & M_EXT)
-				mbcnt += mb->m_ext.ext_size;
-			if (mb->m_next == NULL) {
-				mlast = mb;
-				if (eor)
-					mb->m_flags |= M_EOR;
-			}
+		} else {
+			mc_init_m(&mc, m);
+			if (eor)
+				STAILQ_LAST(&mc.mc_q, mbuf,
+				    m_stailq)->m_flags |= M_EOR;
 		}
 	} else
-		uipc_process_kernel_mbuf(m, &cc, &mbcnt);
+		uipc_process_kernel_mbuf(m, &mc);
 
 	/* XXXGL: see comment in uipc_sosend_dgram(). We are really close
 	 * to stop using send buffer lock at all for unix(4)! */
@@ -1040,8 +1025,7 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 		 * SOCK_SEQPACKET (LOCAL_CREDS => WANTCRED_ONESHOT), or
 		 * forever (LOCAL_CREDS_PERSISTENT => WANTCRED_ALWAYS).
 		 */
-		c = unp_addsockcred(td, c, unp2->unp_flags, &clast, &ctl,
-		    &mbcnt);
+		unp_addsockcred(td, &cmc, unp2->unp_flags);
 		unp2->unp_flags &= ~UNP_WANTCRED_ONESHOT;
 	}
 	UNP_PCB_UNLOCK(unp2);
@@ -1054,17 +1038,14 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 	so2 = unp2->unp_socket;
 	MPASS(so2);
 	sb = &so2->so_rcv;
-	while (ctl + cc > 0) {
-		struct mbuf *mtail, *mnext;
+	while (mc.mc_len + cmc.mc_len > 0) {
+		struct mchain mcnext = MCHAIN_INITIALIZER(&mcnext);
 		u_int space;
-
-		mnext = NULL;
-		mtail = mlast;
 
 		SOCK_RECVBUF_LOCK(so2);
 restart:
 		UIPC_STREAM_SBCHECK(sb);
-		if (__predict_false(ctl > sb->sb_hiwat)) {
+		if (__predict_false(cmc.mc_len > sb->sb_hiwat)) {
 			SOCK_RECVBUF_UNLOCK(so2);
 			error = EMSGSIZE;
 			goto out3;
@@ -1076,7 +1057,7 @@ restart:
 		}
 		MPASS(sb->sb_hiwat >= sb->sb_acc + sb->sb_ctl);
 		space = sb->sb_hiwat - sb->sb_acc - sb->sb_ctl;
-		if (space < sb->sb_lowat || space < ctl) {
+		if (space < sb->sb_lowat || space < cmc.mc_len) {
 			if (nonblock) {
 				SOCK_RECVBUF_UNLOCK(so2);
 				error = EWOULDBLOCK;
@@ -1088,19 +1069,20 @@ restart:
 			} else
 				goto restart;
 		}
-		MPASS(space >= ctl);
-		space -= ctl;
+		MPASS(space >= cmc.mc_len);
+		space -= cmc.mc_len;
 		if (space == 0) {
 			/* There is space only to send control. */
-			MPASS(c != NULL);
-			mnext = m;
-			m = NULL;
-		} else if (space < cc) {
-			/* Not enough space. */
-			mnext = m_split(m, space, M_NOWAIT);
-			if (__predict_false(mnext == NULL)) {
-				struct mbuf *mt;
+			MPASS(!STAILQ_EMPTY(&cmc.mc_q));
+			mcnext = mc;
+			mc = MCHAIN_INITIALIZER(&mc);
+		} else if (space < mc.mc_len) {
+			struct mbuf *mnext;
 
+			/* Not enough space. */
+			mnext = m_split(STAILQ_FIRST(&mc.mc_q), space,
+			    M_NOWAIT);
+			if (__predict_false(mnext == NULL)) {
 				/*
 				 * If allocation failed use M_WAITOK and merge
 				 * the chain back.  Next time m_split() will
@@ -1111,63 +1093,49 @@ restart:
 				 */
 				SOCK_RECVBUF_UNLOCK(so2);
 				printf("going with M_WAITOK\n");
-				mnext = m_split(m, space, M_WAITOK);
-				for (mt = m; mt->m_next != NULL;
-				    mt = mt->m_next)
+				mnext = m_split(STAILQ_FIRST(&mc.mc_q),
+				    space, M_WAITOK);
+				for (m = STAILQ_FIRST(&mc.mc_q);
+				    m->m_next != NULL;
+				    m = m->m_next)
 					;
-				mt->m_next = mnext;
+				m->m_next = mnext;
 				SOCK_RECVBUF_LOCK(so2);
 				goto restart;
 			}
 			/* XXXGL: make m_split operate on chains. */
-			for (mtail = m; mtail->m_next != NULL;
-			    mtail = mtail->m_next)
-				;
-			for (mlast = mnext; mlast->m_next != NULL;
-			    mlast = mlast->m_next)
-				;
-			MPASS(mtail != mlast);
-			sb->sb_acc += space;
-			sb->sb_ccc += space;
-			uio->uio_resid -= space;
-			cc -= space;
-		} else {
-			/* Enough space. */
-			sb->sb_acc += cc;
-			sb->sb_ccc += cc;
-			uio->uio_resid -= cc;
-			cc = 0;
+			mc_init_m(&mc, STAILQ_FIRST(&mc.mc_q));
+			mc_init_m(&mcnext, mnext);
+			MPASS(mc.mc_len == space);
 		}
-		if (c != NULL) {
-			clast->m_next = m;
-			m = c;
-			c = NULL;
-			sb->sb_ctl += ctl;
-			ctl = 0;
+		if (!STAILQ_EMPTY(&cmc.mc_q)) {
+			STAILQ_CONCAT(&sb->sb_mbq, &cmc.mc_q);
+			sb->sb_ctl += cmc.mc_len;
+			cmc.mc_len = 0;
 		}
-		MPASS(m);
-		/* XXXGL: create STAILQ_APPEND */
-		*sb->sb_mbq.stqh_last = m;
-		sb->sb_mbq.stqh_last = &mtail->m_stailq.stqe_next;
+		sb->sb_acc += mc.mc_len;
+		sb->sb_ccc += mc.mc_len;
+		uio->uio_resid -= mc.mc_len;
+		STAILQ_CONCAT(&sb->sb_mbq, &mc.mc_q);
 		UIPC_STREAM_SBCHECK(sb);
 		sorwakeup_locked(so2);
-		m = mnext;
+		mc = mcnext;
 	}
 
-	MPASS(m == NULL);
+	MPASS(STAILQ_EMPTY(&mc.mc_q));
 
 	td->td_ru.ru_msgsnd++;
 
 out3:
 	SOCK_IO_SEND_UNLOCK(so);
 out2:
-	if (c)
-		unp_scan(c, unp_freerights);
+	if (!STAILQ_EMPTY(&cmc.mc_q))
+		unp_scan(STAILQ_FIRST(&cmc.mc_q), unp_freerights);
 out:
-	if (m != NULL)
-		m_freem(m);
-	if (c != NULL)
-		m_freem(c);
+	if (!STAILQ_EMPTY(&mc.mc_q))
+		m_freem(STAILQ_FIRST(&mc.mc_q));
+	if (!STAILQ_EMPTY(&cmc.mc_q))
+		m_freem(STAILQ_FIRST(&cmc.mc_q));
 
 	return (error);
 }
@@ -1460,7 +1428,8 @@ uipc_sosend_dgram(struct socket *so, struct sockaddr *addr, struct uio *uio,
 	const struct sockaddr *from;
 	struct socket *so2;
 	struct sockbuf *sb;
-	struct mbuf *f, *clast;
+	struct mchain cmc = MCHAIN_INITIALIZER(&cmc);
+	struct mbuf *f;
 	u_int cc, ctl, mbcnt;
 	u_int dcc __diagused, dctl __diagused, dmbcnt __diagused;
 	int error;
@@ -1469,7 +1438,6 @@ uipc_sosend_dgram(struct socket *so, struct sockaddr *addr, struct uio *uio,
 
 	error = 0;
 	f = NULL;
-	ctl = 0;
 
 	if (__predict_false(flags & MSG_OOB)) {
 		error = EOPNOTSUPP;
@@ -1488,11 +1456,14 @@ uipc_sosend_dgram(struct socket *so, struct sockaddr *addr, struct uio *uio,
 		f = m_gethdr(M_WAITOK, MT_SONAME);
 		cc = m->m_pkthdr.len;
 		mbcnt = MSIZE + m->m_pkthdr.memlen;
-		if (c != NULL &&
-		    (error = unp_internalize(&c, td, &clast, &ctl, &mbcnt)))
+		if (c != NULL && (error = unp_internalize(c, &cmc, td)))
 			goto out;
 	} else {
-		uipc_process_kernel_mbuf(m, &cc, &mbcnt);
+		struct mchain mc;
+
+		uipc_process_kernel_mbuf(m, &mc);
+		cc = mc.mc_len;
+		mbcnt = mc.mc_mlen;
 		if (__predict_false(m->m_pkthdr.len > unpdg_maxdgram)) {
 			error = EMSGSIZE;
 			goto out;
@@ -1552,8 +1523,7 @@ uipc_sosend_dgram(struct socket *so, struct sockaddr *addr, struct uio *uio,
 	}
 
 	if (unp2->unp_flags & UNP_WANTCRED_MASK)
-		c = unp_addsockcred(td, c, unp2->unp_flags, &clast, &ctl,
-		    &mbcnt);
+		unp_addsockcred(td, &cmc, unp2->unp_flags);
 	if (unp->unp_addr != NULL)
 		from = (struct sockaddr *)unp->unp_addr;
 	else
@@ -1561,25 +1531,21 @@ uipc_sosend_dgram(struct socket *so, struct sockaddr *addr, struct uio *uio,
 	f->m_len = from->sa_len;
 	MPASS(from->sa_len <= MLEN);
 	bcopy(from, mtod(f, void *), from->sa_len);
-	ctl += f->m_len;
 
 	/*
 	 * Concatenate mbufs: from -> control -> data.
 	 * Save overall cc and mbcnt in "from" mbuf.
 	 */
-	if (c != NULL) {
-#ifdef INVARIANTS
-		struct mbuf *mc;
-
-		for (mc = c; mc->m_next != NULL; mc = mc->m_next);
-		MPASS(mc == clast);
-#endif
-		f->m_next = c;
-		clast->m_next = m;
-		c = NULL;
+	if (!STAILQ_EMPTY(&cmc.mc_q)) {
+		f->m_next = STAILQ_FIRST(&cmc.mc_q);
+		STAILQ_LAST(&cmc.mc_q, mbuf, m_stailq)->m_next = m;
+		/* XXXGL: This is dirty as well as rollback after ENOBUFS. */
+		STAILQ_INIT(&cmc.mc_q);
 	} else
 		f->m_next = m;
 	m = NULL;
+	ctl = f->m_len + cmc.mc_len;
+	mbcnt += cmc.mc_mlen;
 #ifdef INVARIANTS
 	dcc = dctl = dmbcnt = 0;
 	for (struct mbuf *mb = f; mb != NULL; mb = mb->m_next) {
@@ -1645,7 +1611,7 @@ uipc_sosend_dgram(struct socket *so, struct sockaddr *addr, struct uio *uio,
 		soroverflow_locked(so2);
 		error = ENOBUFS;
 		if (f->m_next->m_type == MT_CONTROL) {
-			c = f->m_next;
+			STAILQ_FIRST(&cmc.mc_q) = f->m_next;
 			f->m_next = NULL;
 		}
 	}
@@ -1660,13 +1626,13 @@ uipc_sosend_dgram(struct socket *so, struct sockaddr *addr, struct uio *uio,
 out3:
 	SOCK_IO_SEND_UNLOCK(so);
 out2:
-	if (c)
-		unp_scan(c, unp_freerights);
+	if (!STAILQ_EMPTY(&cmc.mc_q))
+		unp_scan(STAILQ_FIRST(&cmc.mc_q), unp_freerights);
 out:
 	if (f)
 		m_freem(f);
-	if (c)
-		m_freem(c);
+	if (!STAILQ_EMPTY(&cmc.mc_q))
+		m_freem(STAILQ_FIRST(&cmc.mc_q));
 	if (m)
 		m_freem(m);
 
@@ -2924,15 +2890,14 @@ unp_internalize_cleanup_rights(struct mbuf *control)
 }
 
 static int
-unp_internalize(struct mbuf **controlp, struct thread *td,
-    struct mbuf **clast, u_int *space, u_int *mbcnt)
+unp_internalize(struct mbuf *control, struct mchain *mc, struct thread *td)
 {
-	struct mbuf *control, **initial_controlp;
 	struct proc *p;
 	struct filedesc *fdesc;
 	struct bintime *bt;
 	struct cmsghdr *cm;
 	struct cmsgcred *cmcred;
+	struct mbuf *m;
 	struct filedescent *fde, **fdep, *fdev;
 	struct file *fp;
 	struct timeval *tv;
@@ -2942,15 +2907,13 @@ unp_internalize(struct mbuf **controlp, struct thread *td,
 	int i, j, error, *fdp, oldfds;
 	u_int newlen;
 
-	MPASS((*controlp)->m_next == NULL); /* COMPAT_OLDSOCK may violate */
+	MPASS(control->m_next == NULL); /* COMPAT_OLDSOCK may violate */
 	UNP_LINK_UNLOCK_ASSERT();
 
 	p = td->td_proc;
 	fdesc = p->p_fd;
 	error = 0;
-	control = *controlp;
-	*controlp = NULL;
-	initial_controlp = controlp;
+	*mc = MCHAIN_INITIALIZER(mc);
 	for (clen = control->m_len, cm = mtod(control, struct cmsghdr *),
 	    data = CMSG_DATA(cm);
 
@@ -2964,10 +2927,10 @@ unp_internalize(struct mbuf **controlp, struct thread *td,
 		datalen = (char *)cm + cm->cmsg_len - (char *)data;
 		switch (cm->cmsg_type) {
 		case SCM_CREDS:
-			*controlp = sbcreatecontrol(NULL, sizeof(*cmcred),
-			    SCM_CREDS, SOL_SOCKET, M_WAITOK);
+			m = sbcreatecontrol(NULL, sizeof(*cmcred), SCM_CREDS,
+			    SOL_SOCKET, M_WAITOK);
 			cmcred = (struct cmsgcred *)
-			    CMSG_DATA(mtod(*controlp, struct cmsghdr *));
+			    CMSG_DATA(mtod(m, struct cmsghdr *));
 			cmcred->cmcred_pid = p->p_pid;
 			cmcred->cmcred_uid = td->td_ucred->cr_ruid;
 			cmcred->cmcred_gid = td->td_ucred->cr_rgid;
@@ -3020,8 +2983,8 @@ unp_internalize(struct mbuf **controlp, struct thread *td,
 			 * Now replace the integer FDs with pointers to the
 			 * file structure and capability rights.
 			 */
-			*controlp = sbcreatecontrol(NULL, newlen,
-			    SCM_RIGHTS, SOL_SOCKET, M_WAITOK);
+			m = sbcreatecontrol(NULL, newlen, SCM_RIGHTS,
+			    SOL_SOCKET, M_WAITOK);
 			fdp = data;
 			for (i = 0; i < oldfds; i++, fdp++) {
 				if (!fhold(fdesc->fd_ofiles[*fdp].fde_file)) {
@@ -3037,7 +3000,7 @@ unp_internalize(struct mbuf **controlp, struct thread *td,
 			}
 			fdp = data;
 			fdep = (struct filedescent **)
-			    CMSG_DATA(mtod(*controlp, struct cmsghdr *));
+			    CMSG_DATA(mtod(m, struct cmsghdr *));
 			fdev = malloc(sizeof(*fdev) * oldfds, M_FILECAPS,
 			    M_WAITOK);
 			for (i = 0; i < oldfds; i++, fdev++, fdp++) {
@@ -3052,34 +3015,34 @@ unp_internalize(struct mbuf **controlp, struct thread *td,
 			break;
 
 		case SCM_TIMESTAMP:
-			*controlp = sbcreatecontrol(NULL, sizeof(*tv),
-			    SCM_TIMESTAMP, SOL_SOCKET, M_WAITOK);
+			m = sbcreatecontrol(NULL, sizeof(*tv), SCM_TIMESTAMP,
+			    SOL_SOCKET, M_WAITOK);
 			tv = (struct timeval *)
-			    CMSG_DATA(mtod(*controlp, struct cmsghdr *));
+			    CMSG_DATA(mtod(m, struct cmsghdr *));
 			microtime(tv);
 			break;
 
 		case SCM_BINTIME:
-			*controlp = sbcreatecontrol(NULL, sizeof(*bt),
-			    SCM_BINTIME, SOL_SOCKET, M_WAITOK);
+			m = sbcreatecontrol(NULL, sizeof(*bt), SCM_BINTIME,
+			    SOL_SOCKET, M_WAITOK);
 			bt = (struct bintime *)
-			    CMSG_DATA(mtod(*controlp, struct cmsghdr *));
+			    CMSG_DATA(mtod(m, struct cmsghdr *));
 			bintime(bt);
 			break;
 
 		case SCM_REALTIME:
-			*controlp = sbcreatecontrol(NULL, sizeof(*ts),
-			    SCM_REALTIME, SOL_SOCKET, M_WAITOK);
+			m = sbcreatecontrol(NULL, sizeof(*ts), SCM_REALTIME,
+			    SOL_SOCKET, M_WAITOK);
 			ts = (struct timespec *)
-			    CMSG_DATA(mtod(*controlp, struct cmsghdr *));
+			    CMSG_DATA(mtod(m, struct cmsghdr *));
 			nanotime(ts);
 			break;
 
 		case SCM_MONOTONIC:
-			*controlp = sbcreatecontrol(NULL, sizeof(*ts),
-			    SCM_MONOTONIC, SOL_SOCKET, M_WAITOK);
+			m = sbcreatecontrol(NULL, sizeof(*ts), SCM_MONOTONIC,
+			    SOL_SOCKET, M_WAITOK);
 			ts = (struct timespec *)
-			    CMSG_DATA(mtod(*controlp, struct cmsghdr *));
+			    CMSG_DATA(mtod(m, struct cmsghdr *));
 			nanouptime(ts);
 			break;
 
@@ -3088,28 +3051,20 @@ unp_internalize(struct mbuf **controlp, struct thread *td,
 			goto out;
 		}
 
-		if (space != NULL) {
-			*space += (*controlp)->m_len;
-			*mbcnt += MSIZE;
-			if ((*controlp)->m_flags & M_EXT)
-				*mbcnt += (*controlp)->m_ext.ext_size;
-			*clast = *controlp;
-		}
-		controlp = &(*controlp)->m_next;
+		mc_append(mc, m);
 	}
 	if (clen > 0)
 		error = EINVAL;
 
 out:
-	if (error != 0 && initial_controlp != NULL)
-		unp_internalize_cleanup_rights(*initial_controlp);
+	if (error != 0)
+		unp_internalize_cleanup_rights(STAILQ_FIRST(&mc->mc_q));
 	m_freem(control);
 	return (error);
 }
 
-static struct mbuf *
-unp_addsockcred(struct thread *td, struct mbuf *control, int mode,
-    struct mbuf **clast, u_int *space, u_int *mbcnt)
+static void
+unp_addsockcred(struct thread *td, struct mchain *mc, int mode)
 {
 	struct mbuf *m, *n, *n_prev;
 	const struct cmsghdr *cm;
@@ -3125,9 +3080,10 @@ unp_addsockcred(struct thread *td, struct mbuf *control, int mode,
 		cmsgtype = SCM_CREDS;
 	}
 
+	/* XXXGL: uipc_sosend_*() need to be improved so that we can M_WAITOK */
 	m = sbcreatecontrol(NULL, ctrlsz, cmsgtype, SOL_SOCKET, M_NOWAIT);
 	if (m == NULL)
-		return (control);
+		return;
 	MPASS((m->m_flags & M_EXT) == 0 && m->m_next == NULL);
 
 	if (mode & UNP_WANTCRED_ALWAYS) {
@@ -3161,50 +3117,18 @@ unp_addsockcred(struct thread *td, struct mbuf *control, int mode,
 	 * created SCM_CREDS control message (struct sockcred) has another
 	 * format.
 	 */
-	if (control != NULL && cmsgtype == SCM_CREDS)
-		for (n = control, n_prev = NULL; n != NULL;) {
+	if (!STAILQ_EMPTY(&mc->mc_q) && cmsgtype == SCM_CREDS)
+		STAILQ_FOREACH_SAFE(n, &mc->mc_q, m_stailq, n_prev) {
 			cm = mtod(n, struct cmsghdr *);
     			if (cm->cmsg_level == SOL_SOCKET &&
 			    cm->cmsg_type == SCM_CREDS) {
-    				if (n_prev == NULL)
-					control = n->m_next;
-				else
-					n_prev->m_next = n->m_next;
-				if (space != NULL) {
-					MPASS(*space >= n->m_len);
-					*space -= n->m_len;
-					MPASS(*mbcnt >= MSIZE);
-					*mbcnt -= MSIZE;
-					if (n->m_flags & M_EXT) {
-						MPASS(*mbcnt >=
-						    n->m_ext.ext_size);
-						*mbcnt -= n->m_ext.ext_size;
-					}
-					MPASS(clast);
-					if (*clast == n) {
-						MPASS(n->m_next == NULL);
-						if (n_prev == NULL)
-							*clast = m;
-						else
-							*clast = n_prev;
-					}
-				}
-				n = m_free(n);
-			} else {
-				n_prev = n;
-				n = n->m_next;
+				mc_remove(mc, n);
+				m_free(n);
 			}
 		}
 
 	/* Prepend it to the head. */
-	m->m_next = control;
-	if (space != NULL) {
-		*space += m->m_len;
-		*mbcnt += MSIZE;
-		if (control == NULL)
-			*clast = m;
-	}
-	return (m);
+	mc_prepend(mc, m);
 }
 
 static struct unpcb *
