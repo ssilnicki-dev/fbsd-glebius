@@ -1077,35 +1077,22 @@ restart:
 			mcnext = mc;
 			mc = MCHAIN_INITIALIZER(&mc);
 		} else if (space < mc.mc_len) {
-			struct mbuf *mnext;
-
 			/* Not enough space. */
-			mnext = m_split(STAILQ_FIRST(&mc.mc_q), space,
-			    M_NOWAIT);
-			if (__predict_false(mnext == NULL)) {
+			if (__predict_false(mc_split(&mc, &mcnext, space,
+			    M_NOWAIT) == ENOMEM)) {
 				/*
 				 * If allocation failed use M_WAITOK and merge
-				 * the chain back.  Next time m_split() will
+				 * the chain back.  Next time mc_split() will
 				 * easily split at the same place.  Only if we
 				 * race with setsockopt(SO_RCVBUF) shrinking
 				 * sb_hiwat, this can happen more than a time.
-				 * XXXGL: make m_split() work with chains.
 				 */
 				SOCK_RECVBUF_UNLOCK(so2);
-				printf("going with M_WAITOK\n");
-				mnext = m_split(STAILQ_FIRST(&mc.mc_q),
-				    space, M_WAITOK);
-				for (m = STAILQ_FIRST(&mc.mc_q);
-				    m->m_next != NULL;
-				    m = m->m_next)
-					;
-				m->m_next = mnext;
+				(void)mc_split(&mc, &mcnext, space, M_WAITOK);
+				mc_concat(&mc, &mcnext);
 				SOCK_RECVBUF_LOCK(so2);
 				goto restart;
 			}
-			/* XXXGL: make m_split operate on chains. */
-			mc_init_m(&mc, STAILQ_FIRST(&mc.mc_q));
-			mc_init_m(&mcnext, mnext);
 			MPASS(mc.mc_len == space);
 		}
 		if (!STAILQ_EMPTY(&cmc.mc_q)) {
