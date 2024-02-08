@@ -1750,6 +1750,17 @@ mc_append(struct mchain *mc, struct mbuf *m)
 	mc_inc(mc, m);
 }
 
+static inline void
+mc_concat(struct mchain *head, struct mchain *tail)
+{
+	STAILQ_CONCAT(&head->mc_q, &tail->mc_q);
+	head->mc_len += tail->mc_len;
+	head->mc_mlen += tail->mc_mlen;
+	tail->mc_len = tail->mc_mlen = 0;
+}
+
+int mc_split(struct mchain *, struct mchain *, u_int, int);
+
 /*
  * Note: STAILQ_REMOVE() is expensive. mc_remove_after() needs to be provided
  * as long as there consumers that would benefit from it.
