@@ -962,27 +962,12 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 			goto out;
 
 		resid = uio->uio_resid;
-		m = m_uiotombuf(uio, M_WAITOK, 0, 0, 0);
-		if (__predict_false(m == NULL)) {
-			error = EFAULT;
+		error = mc_uiotomc(&mc, uio, 0, 0, M_WAITOK, eor ? M_EOR : 0);
+		MPASS(mc.mc_len == resid);
+		MPASS(mc.mc_len > 0 || STAILQ_EMPTY(&mc.mc_q));
+		if (__predict_false(error))
 			goto out2;
-		}
 		uio->uio_resid = resid;
-		/*
-		 * XXXGL: m_uiotombuf() can't return us mbcnt w/o M_PKTHDR.
-		 * Neither works on chains. It also will allocate zero length
-		 * mbuf for empty uio. Should be improved.
-		 */
-		if (__predict_false(m->m_len == 0)) {
-			MPASS(resid == 0);
-			MPASS(m->m_next == 0);
-			m_free(m);
-		} else {
-			mc_init_m(&mc, m);
-			if (eor)
-				STAILQ_LAST(&mc.mc_q, mbuf,
-				    m_stailq)->m_flags |= M_EOR;
-		}
 	} else
 		uipc_process_kernel_mbuf(m, &mc);
 
