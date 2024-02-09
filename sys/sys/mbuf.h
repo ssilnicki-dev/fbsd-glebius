@@ -1761,6 +1761,7 @@ mc_concat(struct mchain *head, struct mchain *tail)
 
 int mc_split(struct mchain *, struct mchain *, u_int, int);
 int mc_get(struct mchain *, u_int, int, short, int);
+int mc_uiotomc(struct mchain *, struct uio *, u_int, u_int, int, int);
 
 /*
  * Note: STAILQ_REMOVE() is expensive. mc_remove_after() needs to be provided
