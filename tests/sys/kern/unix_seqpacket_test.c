@@ -532,6 +532,26 @@ ATF_TC_BODY(send_before_accept, tc)
 	close(a);
 }
 
+/*
+ * If a socket was never accept(2)-ed, internally soabort() is called and
+ * its peer get so_error set to ECONNRESET.
+ */
+ATF_TC_WITHOUT_HEAD(send_to_aborted);
+ATF_TC_BODY(send_to_aborted, tc)
+{
+	const struct sockaddr_un *sun;
+	int l, s;
+
+	sun = mk_listening_socket(&l);
+
+	ATF_REQUIRE((s = socket(PF_LOCAL, SOCK_SEQPACKET, 0)) > 0);
+	ATF_REQUIRE(connect(s, (struct sockaddr *)sun, sizeof(*sun)) == 0);
+	close(l);
+	ATF_REQUIRE(send(s, &s, sizeof(s), 0) == -1);
+	ATF_REQUIRE(errno == ECONNRESET);
+	close(s);
+}
+
 /* Implied connect is unix/dgram only feature. Fails on stream or seqpacket. */
 ATF_TC_WITHOUT_HEAD(implied_connect);
 ATF_TC_BODY(implied_connect, tc)
@@ -1266,6 +1286,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, send_recv_with_connect);
 	ATF_TP_ADD_TC(tp, sendto_recvfrom);
 	ATF_TP_ADD_TC(tp, send_before_accept);
+	ATF_TP_ADD_TC(tp, send_to_aborted);
 	ATF_TP_ADD_TC(tp, implied_connect);
 	ATF_TP_ADD_TC(tp, shutdown_send);
 	ATF_TP_ADD_TC(tp, shutdown_send_sigpipe);
