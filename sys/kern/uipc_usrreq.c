@@ -971,32 +971,18 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 	} else
 		uipc_process_kernel_mbuf(m, &mc);
 
-	/* XXXGL: see comment in uipc_sosend_dgram(). We are really close
-	 * to stop using send buffer lock at all for unix(4)! */
 	error = SOCK_IO_SEND_LOCK(so, SBLOCKWAIT(flags));
 	if (error)
 		goto out2;
-	SOCK_SENDBUF_LOCK(so);
-	if (so->so_snd.sb_state & SBS_CANTSENDMORE) {
-		SOCK_SENDBUF_UNLOCK(so);
-		error = EPIPE;
-		goto out3;
-	}
-	if (so->so_error != 0) {
-		error = so->so_error;
-		so->so_error = 0;
-		SOCK_SENDBUF_UNLOCK(so);
-		goto out3;
-	}
-	if ((so->so_state & SS_ISCONNECTED) == 0) {
-		SOCK_SENDBUF_UNLOCK(so);
-		error = ENOTCONN;
-		goto out3;
-	}
-	SOCK_SENDBUF_UNLOCK(so);
 
 	unp = sotounpcb(so);
 	UNP_PCB_LOCK(unp);
+	if (__predict_false(so->so_error != 0)) {
+		error = so->so_error;
+		so->so_error = 0;
+		UNP_PCB_UNLOCK(unp);
+		goto out3;
+	}
 	unp2 = unp_pcb_lock_peer(unp);
 	UNP_PCB_UNLOCK(unp);
 	if (unp2 == NULL) {
