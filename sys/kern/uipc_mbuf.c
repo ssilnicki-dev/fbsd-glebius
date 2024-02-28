@@ -1131,14 +1131,15 @@ mc_split(struct mchain *head, struct mchain *tail, u_int len0, int wait)
 
 	mlen = 0;
 	len = len0;
-	STAILQ_FOREACH(m, &head->mc_q, m_stailq)
-		if (len > m->m_len) {
+	STAILQ_FOREACH(m, &head->mc_q, m_stailq) {
+		mlen += MSIZE;
+		if (m->m_flags & M_EXT)
+			mlen += m->m_ext.ext_size;
+		if (len > m->m_len)
 			len -= m->m_len;
-			mlen += MSIZE;
-			if (m->m_flags & M_EXT)
-				mlen += m->m_ext.ext_size;
-		} else
+		else
 			break;
+	}
 	if (__predict_false(m == NULL)) {
 		*tail = MCHAIN_INITIALIZER(tail);
 		return (0);
