@@ -917,9 +917,9 @@ static inline void
 uipc_stream_sbcheck(struct sockbuf *sb)
 {
 	struct mbuf *d;
-	u_int dcc, dctl;
+	u_int dcc, dctl, dmbcnt;
 
-	dcc = dctl = 0;
+	dcc = dctl = dmbcnt = 0;
 	STAILQ_FOREACH(d, &sb->sb_mbq, m_stailq) {
 		if (d->m_type == MT_CONTROL)
 			dctl += d->m_len;
@@ -927,17 +927,34 @@ uipc_stream_sbcheck(struct sockbuf *sb)
 			dcc +=  d->m_len;
 		else
 			MPASS(0);
+		dmbcnt += MSIZE;
+		if (d->m_flags & M_EXT)
+			dmbcnt += d->m_ext.ext_size;
 		if (d->m_stailq.stqe_next == NULL)
 			MPASS(sb->sb_mbq.stqh_last == &d->m_stailq.stqe_next);
 	}
 	MPASS(dcc == sb->sb_acc);
 	MPASS(dcc == sb->sb_ccc);
 	MPASS(dctl == sb->sb_ctl);
+	MPASS(dmbcnt == sb->sb_mbcnt);
 }
 #define	UIPC_STREAM_SBCHECK(sb)	uipc_stream_sbcheck(sb)
 #else
 #define	UIPC_STREAM_SBCHECK(sb)	do {} while (0)
 #endif
+
+static inline u_int
+uipc_sbspace(struct sockbuf *sb)
+{
+	u_int space, mbspace;
+
+	MPASS(sb->sb_hiwat >= sb->sb_ccc + sb->sb_ctl);
+	space = sb->sb_hiwat - sb->sb_ccc - sb->sb_ctl;
+	MPASS(sb->sb_mbmax >= sb->sb_mbcnt);
+	mbspace = sb->sb_mbmax - sb->sb_mbcnt;
+
+	return (min(space, mbspace));
+}
 
 static int
 uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
@@ -949,7 +966,6 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 	struct sockbuf *sb;
 	struct mchain mc, cmc;
 	ssize_t resid, sent;
-	u_int sendspace;
 	bool nonblock, eor;
 	int error;
 
@@ -964,7 +980,6 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 	nonblock = (so->so_state & SS_NBIO) ||
 	    (flags & (MSG_DONTWAIT | MSG_NBIO));
 	eor = flags & MSG_EOR;
-	sendspace = so->so_snd.sb_hiwat;
 
 	mc = MCHAIN_INITIALIZER(&mc);
 	cmc = MCHAIN_INITIALIZER(&cmc);
@@ -978,7 +993,7 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 		 * buffer - do the copyout before taking any locks.
 		 */
 		resid = uio->uio_resid;
-		error = mc_uiotomc(&mc, uio, sendspace, 0, M_WAITOK,
+		error = mc_uiotomc(&mc, uio, so->so_snd.sb_hiwat, 0, M_WAITOK,
 		    eor ? M_EOR : 0);
 		if (__predict_false(error))
 			goto out2;
@@ -1047,8 +1062,7 @@ restart:
 		 * space to put at least control.  The data is a stream and can
 		 * be put partially, but control is really a datagram.
 		 */
-		MPASS(sb->sb_hiwat >= sb->sb_ccc + sb->sb_ctl);
-		space = sb->sb_hiwat - sb->sb_ccc - sb->sb_ctl;
+		space = uipc_sbspace(sb);
 		if (space < sb->sb_lowat || space < cmc.mc_len) {
 			if (nonblock) {
 				SOCK_RECVBUF_UNLOCK(so2);
@@ -1090,18 +1104,23 @@ restart:
 		if (!STAILQ_EMPTY(&cmc.mc_q)) {
 			STAILQ_CONCAT(&sb->sb_mbq, &cmc.mc_q);
 			sb->sb_ctl += cmc.mc_len;
+			sb->sb_mbcnt += cmc.mc_mlen;
 			cmc.mc_len = 0;
 		}
+		sent += mc.mc_len;
 		sb->sb_acc += mc.mc_len;
 		sb->sb_ccc += mc.mc_len;
-		sent += mc.mc_len;
+		sb->sb_mbcnt += mc.mc_mlen;
+		space = uipc_sbspace(sb);
 		STAILQ_CONCAT(&sb->sb_mbq, &mc.mc_q);
 		UIPC_STREAM_SBCHECK(sb);
 		sorwakeup_locked(so2);
 		mc = mcnext;
 		if (STAILQ_EMPTY(&mc.mc_q) &&
 		    uio != NULL && uio->uio_resid > 0) {
-			error = mc_uiotomc(&mc, uio, sendspace, 0, M_WAITOK,
+			/* Receive buffer space + virtual send buffer size. */
+			error = mc_uiotomc(&mc, uio,
+			    space + so->so_snd.sb_hiwat, 0, M_WAITOK,
 			    eor ? M_EOR : 0);
 			if (__predict_false(error))
 				goto out4;
@@ -1136,7 +1155,7 @@ uipc_soreceive_stream_or_seqpacket(struct socket *so, struct sockaddr **psa,
 {
 	struct sockbuf *sb = &so->so_rcv;
 	struct mbuf *control, *m, *first, *last, *next;
-	u_int ctl, space, datalen, lastlen;
+	u_int ctl, space, datalen, mbcnt, lastlen;
 	int error, flags;
 	bool nonblock, waitall, peek;
 
@@ -1195,6 +1214,7 @@ restart:
 	MPASS(STAILQ_FIRST(&sb->sb_mbq));
 	MPASS(sb->sb_acc > 0 || sb->sb_ctl > 0);
 
+	mbcnt = 0;
 	ctl = 0;
 	first = STAILQ_FIRST(&sb->sb_mbq);
 	if (first->m_type == MT_CONTROL) {
@@ -1203,6 +1223,9 @@ restart:
 			if (first->m_type != MT_CONTROL)
 				break;
 			ctl += first->m_len;
+			mbcnt += MSIZE;
+			if (first->m_flags & M_EXT)
+				mbcnt += first->m_ext.ext_size;
 		}
 	} else
 		control = NULL;
@@ -1225,6 +1248,9 @@ restart:
 		if (space >= m->m_len) {
 			space -= m->m_len;
 			datalen += m->m_len;
+			mbcnt += MSIZE;
+			if (m->m_flags & M_EXT)
+				mbcnt += m->m_ext.ext_size;
 			if (m->m_flags & M_EOR) {
 				last = STAILQ_NEXT(m, m_stailq);
 				lastlen = 0;
@@ -1254,6 +1280,8 @@ restart:
 		sb->sb_ccc -= datalen;
 		MPASS(sb->sb_ctl >= ctl);
 		sb->sb_ctl -= ctl;
+		MPASS(sb->sb_mbcnt >= mbcnt);
+		sb->sb_mbcnt -= mbcnt;
 		UIPC_STREAM_SBCHECK(sb);
 		/* Mind the name.  We are waking writer here, not reader. */
 		sorwakeup_locked(so);
@@ -1271,7 +1299,7 @@ restart:
 			 * where it can't progress forward with reading.
 			 * Probability of such a failure is really low, so it
 			 * is fine that we need to perform pretty complex
-			 * operation here to reconstruct of the buffer.  This
+			 * operation here to reconstruct the buffer.  This
 			 * should be safe as we own top of the queue due to the
 			 * sx(9) lock, but we need check if we raced with
 			 * shutdown(2).
@@ -1298,12 +1326,21 @@ restart:
 					else
 						STAILQ_FIRST(&sb->sb_mbq) =
 						    control;
-					sb->sb_ctl = 0;
-					STAILQ_FOREACH(c, &sb->sb_mbq, m_stailq)
-						if (c->m_type == MT_CONTROL)
-							sb->sb_ctl += c->m_len;
-					sb->sb_acc += datalen;
-					sb->sb_ccc += datalen;
+					sb->sb_ctl = sb->sb_acc = sb->sb_ccc =
+					    sb->sb_mbcnt = 0;
+					STAILQ_FOREACH(m, &sb->sb_mbq,
+					    m_stailq) {
+						if (m->m_type == MT_DATA) {
+							sb->sb_acc += m->m_len;
+							sb->sb_ccc += m->m_len;
+						} else {
+							sb->sb_ctl += m->m_len;
+						}
+						sb->sb_mbcnt += MSIZE;
+						if (m->m_flags & M_EXT)
+							sb->sb_mbcnt +=
+							    m->m_ext.ext_size;
+					}
 				}
 				UIPC_STREAM_SBCHECK(sb);
 				SOCK_RECVBUF_UNLOCK(so);
