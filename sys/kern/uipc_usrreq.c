@@ -141,8 +141,11 @@ static struct timeout_task unp_gc_task;
 static struct task	unp_defer_task;
 
 /*
- * unix(4) sockets fully bypass the send buffer, thus reserve only receive
- * space.
+ * unix(4) sockets fully bypass the send buffer, however the notion of send
+ * buffer still makes sense with them.  It is amount of space, a send(2)
+ * syscall may copyin(9) before checking with the receive buffer of a peer.
+ * Although not linked anywhere, pointed to by a stack variable, effecetively
+ * it is a buffer that needs to be sized.
  *
  * Datagram sockets really use the sendspace as the maximum datagram size,
  * and don't really want to reserve the sendspace.  Their recvspace should be
@@ -151,9 +154,11 @@ static struct task	unp_defer_task;
 #ifndef PIPSIZ
 #define	PIPSIZ	8192
 #endif
+static u_long	unpst_sendspace = PIPSIZ;
 static u_long	unpst_recvspace = PIPSIZ;
 static u_long	unpdg_maxdgram = 8*1024;	/* support 8KB syslog msgs */
 static u_long	unpdg_recvspace = 16*1024;
+static u_long	unpsp_sendspace = PIPSIZ;
 static u_long	unpsp_recvspace = PIPSIZ;
 
 static SYSCTL_NODE(_net, PF_LOCAL, local, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
@@ -168,12 +173,16 @@ static SYSCTL_NODE(_net_local, SOCK_SEQPACKET, seqpacket,
     CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "SOCK_SEQPACKET");
 
+SYSCTL_ULONG(_net_local_stream, OID_AUTO, sendspace, CTLFLAG_RW,
+	   &unpst_sendspace, 0, "Default stream send space.");
 SYSCTL_ULONG(_net_local_stream, OID_AUTO, recvspace, CTLFLAG_RW,
 	   &unpst_recvspace, 0, "Default stream receive space.");
 SYSCTL_ULONG(_net_local_dgram, OID_AUTO, maxdgram, CTLFLAG_RW,
 	   &unpdg_maxdgram, 0, "Maximum datagram size.");
 SYSCTL_ULONG(_net_local_dgram, OID_AUTO, recvspace, CTLFLAG_RW,
 	   &unpdg_recvspace, 0, "Default datagram receive space.");
+SYSCTL_ULONG(_net_local_seqpacket, OID_AUTO, maxseqpacket, CTLFLAG_RW,
+	   &unpsp_sendspace, 0, "Default seqpacket send space.");
 SYSCTL_ULONG(_net_local_seqpacket, OID_AUTO, recvspace, CTLFLAG_RW,
 	   &unpsp_recvspace, 0, "Default seqpacket receive space.");
 SYSCTL_INT(_net_local, OID_AUTO, inflight, CTLFLAG_RD, &unp_rights, 0,
@@ -439,7 +448,7 @@ uipc_attach(struct socket *so, int proto, struct thread *td)
 	if (so->so_snd.sb_hiwat == 0 || so->so_rcv.sb_hiwat == 0) {
 		switch (so->so_type) {
 		case SOCK_STREAM:
-			sendspace = 0;
+			sendspace = unpst_sendspace;
 			recvspace = unpst_recvspace;
 			STAILQ_INIT(&so->so_rcv.sb_mbq);
 			break;
@@ -457,7 +466,7 @@ uipc_attach(struct socket *so, int proto, struct thread *td)
 			break;
 
 		case SOCK_SEQPACKET:
-			sendspace = 0;
+			sendspace = unpsp_sendspace;
 			recvspace = unpsp_recvspace;
 			STAILQ_INIT(&so->so_rcv.sb_mbq);
 			break;
@@ -839,6 +848,8 @@ uipc_listen(struct socket *so, int backlog, struct thread *td)
 	error = solisten_proto_check(so);
 	if (error == 0) {
 		cru2xt(td, &unp->unp_peercred);
+		(void)chgsbsize(so->so_cred->cr_uidinfo, &so->so_snd.sb_hiwat,
+		    0, RLIM_INFINITY);
 		(void)chgsbsize(so->so_cred->cr_uidinfo, &so->so_rcv.sb_hiwat,
 		    0, RLIM_INFINITY);
 		solisten_proto(so, backlog);
@@ -937,6 +948,8 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 	struct socket *so2;
 	struct sockbuf *sb;
 	struct mchain mc, cmc;
+	ssize_t resid, sent;
+	u_int sendspace;
 	bool nonblock, eor;
 	int error;
 
@@ -951,23 +964,24 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 	nonblock = (so->so_state & SS_NBIO) ||
 	    (flags & (MSG_DONTWAIT | MSG_NBIO));
 	eor = flags & MSG_EOR;
+	sendspace = so->so_snd.sb_hiwat;
 
 	mc = MCHAIN_INITIALIZER(&mc);
 	cmc = MCHAIN_INITIALIZER(&cmc);
+	sent = 0;
 
 	if (m == NULL) {
-		ssize_t resid;
-
 		if (c != NULL && (error = unp_internalize(c, &cmc, td)))
 			goto out;
-
+		/*
+		 * Optimization for a case when our send fits into the receive
+		 * buffer - do the copyout before taking any locks.
+		 */
 		resid = uio->uio_resid;
-		error = mc_uiotomc(&mc, uio, 0, 0, M_WAITOK, eor ? M_EOR : 0);
-		MPASS(mc.mc_len == resid);
-		MPASS(mc.mc_len > 0 || STAILQ_EMPTY(&mc.mc_q));
+		error = mc_uiotomc(&mc, uio, sendspace, 0, M_WAITOK,
+		    eor ? M_EOR : 0);
 		if (__predict_false(error))
 			goto out2;
-		uio->uio_resid = resid;
 	} else
 		uipc_process_kernel_mbuf(m, &mc);
 
@@ -999,15 +1013,17 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 		unp_addsockcred(td, &cmc, unp2->unp_flags);
 		unp2->unp_flags &= ~UNP_WANTCRED_ONESHOT;
 	}
-	UNP_PCB_UNLOCK(unp2);
 
 	/*
-	 * Wait on the peer socket receive buffer until we have enough space
-	 * to put at least control.  The data is a stream and can be put
-	 * partially, but control is really a datagram.
+	 * Cycle through the data to send and available space in the peer's
+	 * receive buffer.  Put a reference on the peer socket, so that it
+	 * doesn't get freed while we sbwait().  If peer goes away, we will
+	 * observe the SBS_CANTRCVMORE and our sorele() will finalize peer's
+	 * socket destruction.
 	 */
 	so2 = unp2->unp_socket;
-	MPASS(so2);
+	soref(so2);
+	UNP_PCB_UNLOCK(unp2);
 	sb = &so2->so_rcv;
 	while (mc.mc_len + cmc.mc_len > 0) {
 		struct mchain mcnext = MCHAIN_INITIALIZER(&mcnext);
@@ -1019,24 +1035,29 @@ restart:
 		if (__predict_false(cmc.mc_len > sb->sb_hiwat)) {
 			SOCK_RECVBUF_UNLOCK(so2);
 			error = EMSGSIZE;
-			goto out3;
+			goto out4;
 		};
 		if (__predict_false(sb->sb_state & SBS_CANTRCVMORE)) {
 			SOCK_RECVBUF_UNLOCK(so2);
 			error = EPIPE;
-			goto out3;
+			goto out4;
 		}
-		MPASS(sb->sb_hiwat >= sb->sb_acc + sb->sb_ctl);
-		space = sb->sb_hiwat - sb->sb_acc - sb->sb_ctl;
+		/*
+		 * Wait on the peer socket receive buffer until we have enough
+		 * space to put at least control.  The data is a stream and can
+		 * be put partially, but control is really a datagram.
+		 */
+		MPASS(sb->sb_hiwat >= sb->sb_ccc + sb->sb_ctl);
+		space = sb->sb_hiwat - sb->sb_ccc - sb->sb_ctl;
 		if (space < sb->sb_lowat || space < cmc.mc_len) {
 			if (nonblock) {
 				SOCK_RECVBUF_UNLOCK(so2);
 				error = EWOULDBLOCK;
-				goto out3;
+				goto out4;
 			}
 			if ((error = sbwait(so2, SO_RCV)) != 0) {
 				SOCK_RECVBUF_UNLOCK(so2);
-				goto out3;
+				goto out4;
 			} else
 				goto restart;
 		}
@@ -1073,17 +1094,25 @@ restart:
 		}
 		sb->sb_acc += mc.mc_len;
 		sb->sb_ccc += mc.mc_len;
-		uio->uio_resid -= mc.mc_len;
+		sent += mc.mc_len;
 		STAILQ_CONCAT(&sb->sb_mbq, &mc.mc_q);
 		UIPC_STREAM_SBCHECK(sb);
 		sorwakeup_locked(so2);
 		mc = mcnext;
+		if (STAILQ_EMPTY(&mc.mc_q) &&
+		    uio != NULL && uio->uio_resid > 0) {
+			error = mc_uiotomc(&mc, uio, sendspace, 0, M_WAITOK,
+			    eor ? M_EOR : 0);
+			if (__predict_false(error))
+				goto out4;
+		}
 	}
 
 	MPASS(STAILQ_EMPTY(&mc.mc_q));
 
 	td->td_ru.ru_msgsnd++;
-
+out4:
+	sorele(so2);
 out3:
 	SOCK_IO_SEND_UNLOCK(so);
 out2:
@@ -1094,6 +1123,9 @@ out:
 		m_freem(STAILQ_FIRST(&mc.mc_q));
 	if (!STAILQ_EMPTY(&cmc.mc_q))
 		m_freem(STAILQ_FIRST(&cmc.mc_q));
+
+	if (uio != NULL)
+		uio->uio_resid = resid - sent;
 
 	return (error);
 }
