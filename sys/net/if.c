@@ -4894,6 +4894,12 @@ if_getlladdr(const if_t ifp)
 	return (IF_LLADDR(ifp));
 }
 
+struct sockaddr_dl *
+if_getaddr(const if_t ifp)
+{
+	return ((struct sockaddr_dl *)((ifp)->if_addr->ifa_addr));
+}
+
 void *
 if_gethandle(u_char type)
 {
