@@ -183,19 +183,17 @@ irdma_ieq_check_mpacrc(void *desc,
 }
 
 static u_int
-irdma_add_ipv6_cb(void *arg, struct ifaddr *addr, u_int count __unused)
+irdma_add_ipv6_cb(void *arg, struct sockaddr *sa, u_int count __unused)
 {
 	struct irdma_device *iwdev = arg;
-	struct sockaddr_in6 *sin6;
+	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
 	u32 local_ipaddr6[4] = {};
 	char ip6buf[INET6_ADDRSTRLEN];
 	u8 *mac_addr;
 
-	sin6 = (struct sockaddr_in6 *)addr->ifa_addr;
-
 	irdma_copy_ip_ntohl(local_ipaddr6, (u32 *)&sin6->sin6_addr);
 
-	mac_addr = if_getlladdr(addr->ifa_ifp);
+	mac_addr = if_getlladdr(iwdev->netdev);
 
 	printf("%s:%d IP=%s, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
 	       __func__, __LINE__,
@@ -222,18 +220,16 @@ irdma_add_ipv6_addr(struct irdma_device *iwdev, struct ifnet *ifp)
 }
 
 static u_int
-irdma_add_ipv4_cb(void *arg, struct ifaddr *addr, u_int count __unused)
+irdma_add_ipv4_cb(void *arg, struct sockaddr *sa, u_int count __unused)
 {
 	struct irdma_device *iwdev = arg;
-	struct sockaddr_in *sin;
+	struct sockaddr_in *sin = (struct sockaddr_in *)sa;
 	u32 ip_addr[4] = {};
 	uint8_t *mac_addr;
 
-	sin = (struct sockaddr_in *)addr->ifa_addr;
-
 	ip_addr[0] = ntohl(sin->sin_addr.s_addr);
 
-	mac_addr = if_getlladdr(addr->ifa_ifp);
+	mac_addr = if_getlladdr(iwdev->netdev);
 
 	printf("%s:%d IP=%d.%d.%d.%d, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
 	       __func__, __LINE__,

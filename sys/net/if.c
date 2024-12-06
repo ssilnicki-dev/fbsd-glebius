@@ -4712,7 +4712,7 @@ if_foreach_addr_type(if_t ifp, int type, if_addr_cb_t cb, void *cb_arg)
 	CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 		if (ifa->ifa_addr->sa_family != type)
 			continue;
-		count += (*cb)(cb_arg, ifa, count);
+		count += (*cb)(cb_arg, ifa->ifa_addr, count);
 	}
 	NET_EPOCH_EXIT(et);
 

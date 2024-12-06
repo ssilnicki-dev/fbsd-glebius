@@ -677,7 +677,7 @@ u_int if_llmaddr_count(if_t);
 bool if_maddr_empty(if_t);
 
 struct ifaddr * if_getifaddr(const if_t ifp);
-typedef u_int if_addr_cb_t(void *, struct ifaddr *, u_int);
+typedef u_int if_addr_cb_t(void *, struct sockaddr *, u_int);
 u_int if_foreach_addr_type(if_t ifp, int type, if_addr_cb_t cb, void *cb_arg);
 
 typedef int (*if_foreach_cb_t)(if_t, void *);

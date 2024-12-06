@@ -414,6 +414,7 @@ struct irdma_add_mqh_cbs {
 	struct irdma_device *iwdev;
 	struct irdma_cm_info *cm_info;
 	struct irdma_cm_listener *cm_listen_node;
+	if_t curif;	/* used by if_foreach_addr_type() iterator */
 };
 
 int irdma_schedule_cm_timer(struct irdma_cm_node *cm_node,

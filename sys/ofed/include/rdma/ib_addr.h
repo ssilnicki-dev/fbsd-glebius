@@ -227,10 +227,9 @@ static inline void rdma_gid2ip(struct sockaddr *out, const union ib_gid *gid)
 }
 
 static u_int
-_iboe_addr_get_sgid_ia_cb(void *arg, struct ifaddr *ifa, u_int count __unused)
+_iboe_addr_get_sgid_ia_cb(void *arg, struct sockaddr *sa, u_int count __unused)
 {
-	ipv6_addr_set_v4mapped(((struct sockaddr_in *)
-			       ifa->ifa_addr)->sin_addr.s_addr,
+	ipv6_addr_set_v4mapped(((struct sockaddr_in *)sa)->sin_addr.s_addr,
 			       (struct in6_addr *)arg);
 	return (0);
 }

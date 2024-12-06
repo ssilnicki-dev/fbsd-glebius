@@ -2120,7 +2120,7 @@ linux_ioctl_ifname(struct thread *td, struct l_ifreq *uifr)
  * Implement the SIOCGIFCONF ioctl
  */
 static u_int
-linux_ifconf_ifaddr_cb(void *arg, struct ifaddr *ifa, u_int count)
+linux_ifconf_ifaddr_cb(void *arg, struct sockaddr *sa, u_int count)
 {
 #ifdef COMPAT_LINUX32
 	struct l_ifconf *ifc;
@@ -2149,10 +2149,9 @@ struct linux_ifconfig_ifaddr_cb2_s {
 };
 
 static u_int
-linux_ifconf_ifaddr_cb2(void *arg, struct ifaddr *ifa, u_int len)
+linux_ifconf_ifaddr_cb2(void *arg, struct sockaddr *sa, u_int len)
 {
 	struct linux_ifconfig_ifaddr_cb2_s *cbs = arg;
-	struct sockaddr *sa = ifa->ifa_addr;
 
 	cbs->ifr.ifr_addr.sa_family = LINUX_AF_INET;
 	memcpy(cbs->ifr.ifr_addr.sa_data, sa->sa_data,

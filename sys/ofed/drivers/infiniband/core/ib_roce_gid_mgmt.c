@@ -158,13 +158,16 @@ struct ipx_entry {
 	if_t ndev;
 };
 
-STAILQ_HEAD(ipx_queue, ipx_entry);
+struct ipx_ctx {
+	STAILQ_HEAD(, ipx_entry) head;
+	if_t curdev;
+};
 
 #ifdef INET
 static u_int
-roce_gid_update_addr_ifa4_cb(void *arg, struct ifaddr *ifa, u_int count)
+roce_gid_update_addr_ifa4_cb(void *arg, struct sockaddr *sa, u_int count)
 {
-	struct ipx_queue *ipx_head = arg;
+	struct ipx_ctx *ipx_ctx = arg;
 	struct ipx_entry *entry;
 
 	entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
@@ -173,9 +176,9 @@ roce_gid_update_addr_ifa4_cb(void *arg, struct ifaddr *ifa, u_int count)
 		    "couldn't allocate entry for IPv4 update\n");
 		return (0);
 	}
-	entry->ipx_addr.v4 = *((struct sockaddr_in *)ifa->ifa_addr);
-	entry->ndev = ifa->ifa_ifp;
-	STAILQ_INSERT_TAIL(ipx_head, entry, entry);
+	entry->ipx_addr.v4 = *((struct sockaddr_in *)sa);
+	entry->ndev = ipx_ctx->curdev;
+	STAILQ_INSERT_TAIL(&ipx_ctx->head, entry, entry);
 
 	return (1);
 }
@@ -183,9 +186,9 @@ roce_gid_update_addr_ifa4_cb(void *arg, struct ifaddr *ifa, u_int count)
 
 #ifdef INET6
 static u_int
-roce_gid_update_addr_ifa6_cb(void *arg, struct ifaddr *ifa, u_int count)
+roce_gid_update_addr_ifa6_cb(void *arg, struct sockaddr *sa, u_int count)
 {
-	struct ipx_queue *ipx_head = arg;
+	struct ipx_ctx *ipx_ctx = arg;
 	struct ipx_entry *entry;
 
 	entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
@@ -194,14 +197,14 @@ roce_gid_update_addr_ifa6_cb(void *arg, struct ifaddr *ifa, u_int count)
 		    "couldn't allocate entry for IPv6 update\n");
 		return (0);
 	}
-	entry->ipx_addr.v6 = *((struct sockaddr_in6 *)ifa->ifa_addr);
-	entry->ndev = ifa->ifa_ifp;
+	entry->ipx_addr.v6 = *((struct sockaddr_in6 *)sa);
+	entry->ndev = ipx_ctx->curdev;
 
 	/* trash IPv6 scope ID */
 	sa6_recoverscope(&entry->ipx_addr.v6);
 	entry->ipx_addr.v6.sin6_scope_id = 0;
 
-	STAILQ_INSERT_TAIL(ipx_head, entry, entry);
+	STAILQ_INSERT_TAIL(&ipx_ctx->head, entry, entry);
 
 	return (1);
 }
@@ -222,9 +225,9 @@ roce_gid_update_addr_callback(struct ib_device *device, u8 port,
 	u16 index_num;
 	int i;
 
-	struct ipx_queue ipx_head;
-
-	STAILQ_INIT(&ipx_head);
+	struct ipx_ctx ipx_ctx = {
+		.head = STAILQ_HEAD_INITIALIZER(ipx_ctx.head)
+	};
 
 	/* make sure default GIDs are in */
 	default_gids = roce_gid_enum_netdev_default(device, port, ndev);
@@ -242,11 +245,14 @@ roce_gid_update_addr_callback(struct ib_device *device, u8 port,
 		}
 
 		/* clone address information for IPv4 and IPv6 */
+		ipx_ctx.curdev = ifp;
 #if defined(INET)
-		if_foreach_addr_type(ifp, AF_INET, roce_gid_update_addr_ifa4_cb, &ipx_head);
+		if_foreach_addr_type(ifp, AF_INET,
+		    roce_gid_update_addr_ifa4_cb, &ipx_ctx);
 #endif
 #if defined(INET6)
-		if_foreach_addr_type(ifp, AF_INET6, roce_gid_update_addr_ifa6_cb, &ipx_head);
+		if_foreach_addr_type(ifp, AF_INET6,
+		    roce_gid_update_addr_ifa6_cb, &ipx_ctx);
 #endif
 	    }
 	    NET_EPOCH_EXIT(et);
@@ -255,7 +261,7 @@ roce_gid_update_addr_callback(struct ib_device *device, u8 port,
 	VNET_LIST_RUNLOCK();
 
 	/* add missing GIDs, if any */
-	STAILQ_FOREACH(entry, &ipx_head, entry) {
+	STAILQ_FOREACH(entry, &ipx_ctx.head, entry) {
 		unsigned long gid_type_mask = roce_gid_type_mask_support(device, port);
 
 		if (rdma_ip2gid(&entry->ipx_addr.sa[0], &gid) != 0)
@@ -294,7 +300,7 @@ roce_gid_update_addr_callback(struct ib_device *device, u8 port,
 
 		rdma_gid2ip(&ipx.sa[0], &gid);
 
-		STAILQ_FOREACH(entry, &ipx_head, entry) {
+		STAILQ_FOREACH(entry, &ipx_ctx.head, entry) {
 			if (entry->ndev == ndev &&
 			    memcmp(&entry->ipx_addr, &ipx, sizeof(ipx)) == 0)
 				break;
@@ -307,8 +313,8 @@ roce_gid_update_addr_callback(struct ib_device *device, u8 port,
 		update_gid(GID_DEL, device, port, &gid, ndev);
 	}
 
-	while ((entry = STAILQ_FIRST(&ipx_head))) {
-		STAILQ_REMOVE_HEAD(&ipx_head, entry);
+	while ((entry = STAILQ_FIRST(&ipx_ctx.head))) {
+		STAILQ_REMOVE_HEAD(&ipx_ctx.head, entry);
 		kfree(entry);
 	}
 }

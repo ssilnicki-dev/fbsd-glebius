@@ -861,13 +861,13 @@ struct qlnx_cb_s {
 };
 
 static u_int
-qlnxr_add_ip_based_gid_cb(void *arg, struct ifaddr *ifa, u_int count)
+qlnxr_add_ip_based_gid_cb(void *arg, struct sockaddr *sa, u_int count)
 {
 	struct qlnx_cb_s *cba = arg;
 
-	QL_DPRINT12(cba->dev->ha, "IP address : %x\n", ((struct sockaddr_in *) ifa->ifa_addr)->sin_addr.s_addr);
+	QL_DPRINT12(cba->dev->ha, "IP address : %x\n", ((struct sockaddr_in *)sa)->sin_addr.s_addr);
 	ipv6_addr_set_v4mapped(
-		((struct sockaddr_in *) ifa->ifa_addr)->sin_addr.s_addr,
+		((struct sockaddr_in *)sa)->sin_addr.s_addr,
 		(struct in6_addr *)&cba->gid);
 	QL_DPRINT12(cba->dev->ha, "gid generated : %llx\n", cba->gid);
 

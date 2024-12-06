@@ -1718,14 +1718,14 @@ irdma_manage_qhash_wait(struct irdma_pci_f *rf, struct irdma_cm_info *cm_info)
  * on the adapter and adds the associated qhash filter
  */
 static u_int
-irdma_add_mqh_ifa_cb(void *arg, struct ifaddr *ifa, u_int count)
+irdma_add_mqh_ifa_cb(void *arg, struct sockaddr *sa, u_int count)
 {
 	struct irdma_add_mqh_cbs *cbs = arg;
 	struct irdma_cm_listener *child_listen_node;
 	struct irdma_cm_info *cm_info = cbs->cm_info;
 	struct irdma_device *iwdev = cbs->iwdev;
 	struct irdma_cm_listener *cm_parent_listen_node = cbs->cm_listen_node;
-	if_t ip_dev = ifa->ifa_ifp;
+	if_t ip_dev = cbs->curif;
 	unsigned long flags;
 	int ret;
 
@@ -1746,23 +1746,23 @@ irdma_add_mqh_ifa_cb(void *arg, struct ifaddr *ifa, u_int count)
 	if (cm_info->ipv4) {
 		irdma_debug(&iwdev->rf->sc_dev, IRDMA_DEBUG_CM,
 			    "Allocating child CM Listener forIP=%x, vlan_id=%d, MAC=%x:%x:%x:%x:%x:%x\n",
-			    ((struct sockaddr_in *)&ifa->ifa_addr)->sin_addr.s_addr,
+			    ((struct sockaddr_in *)sa)->sin_addr.s_addr,
 			    rdma_vlan_dev_vlan_id(ip_dev),
 			    if_getlladdr(ip_dev)[0], if_getlladdr(ip_dev)[1],
 			    if_getlladdr(ip_dev)[2], if_getlladdr(ip_dev)[3],
 			    if_getlladdr(ip_dev)[4], if_getlladdr(ip_dev)[5]);
 		child_listen_node->loc_addr[0] =
-		    ntohl(((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr);
+		    ntohl(((struct sockaddr_in *)sa)->sin_addr.s_addr);
 	} else {
 		irdma_debug(&iwdev->rf->sc_dev, IRDMA_DEBUG_CM,
 			    "IP=%x:%x:%x:%x, vlan_id=%d, MAC=%x:%x:%x:%x:%x:%x\n",
-			    IRDMA_PRINT_IP6(&((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr),
+			    IRDMA_PRINT_IP6(&((struct sockaddr_in6 *)sa)->sin6_addr),
 			    rdma_vlan_dev_vlan_id(ip_dev),
 			    if_getlladdr(ip_dev)[0], if_getlladdr(ip_dev)[1],
 			    if_getlladdr(ip_dev)[2], if_getlladdr(ip_dev)[3],
 			    if_getlladdr(ip_dev)[4], if_getlladdr(ip_dev)[5]);
 		irdma_copy_ip_ntohl(child_listen_node->loc_addr,
-				    ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr.__u6_addr.__u6_addr32);
+				    ((struct sockaddr_in6 *)sa)->sin6_addr.__u6_addr.__u6_addr32);
 	}
 	memcpy(cm_info->loc_addr, child_listen_node->loc_addr,
 	       sizeof(cm_info->loc_addr));
@@ -1832,6 +1832,7 @@ irdma_add_mqh(struct irdma_device *iwdev,
 			    ifp != iwdev->netdev)
 				continue;
 
+			cbs.curif = ifp;
 			if_addr_rlock(ifp);
 			if (cm_info->ipv4)
 				err = if_foreach_addr_type(ifp, AF_INET, irdma_add_mqh_ifa_cb, &cbs);

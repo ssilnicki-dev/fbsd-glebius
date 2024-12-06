@@ -468,9 +468,9 @@ bsd_to_linux_ifflags(int fl)
 }
 
 static u_int
-linux_ifhwaddr_cb(void *arg, struct ifaddr *ifa, u_int count)
+linux_ifhwaddr_cb(void *arg, struct sockaddr *sa, u_int count)
 {
-	struct sockaddr_dl *sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+	struct sockaddr_dl *sdl = (struct sockaddr_dl *)sa;
 	struct l_sockaddr *lsa = arg;
 
 	if (count > 0)

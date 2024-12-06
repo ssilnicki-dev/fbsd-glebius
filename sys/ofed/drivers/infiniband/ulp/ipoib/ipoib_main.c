@@ -1119,7 +1119,7 @@ ipoib_remove_one(struct ib_device *device, void *client_data)
 }
 
 static u_int
-ipoib_match_dev_addr_cb(void *arg, struct ifaddr *ifa, u_int count)
+ipoib_match_dev_addr_cb(void *arg, struct sockaddr *sa, u_int count)
 {
 	struct sockaddr *addr = arg;
 
@@ -1127,10 +1127,10 @@ ipoib_match_dev_addr_cb(void *arg, struct ifaddr *ifa, u_int count)
 	if (count > 0)
 		return (0);
 
-	if (ifa->ifa_addr->sa_len != addr->sa_len)
+	if (sa->sa_len != addr->sa_len)
 		return (0);
 
-	if (memcmp(ifa->ifa_addr, addr, addr->sa_len) == 0)
+	if (memcmp(sa, addr, addr->sa_len) == 0)
 		return (1);
 
 	return (0);

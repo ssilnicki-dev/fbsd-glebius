@@ -1493,9 +1493,9 @@ bootpc_decode_reply(struct nfsv3_diskless *nd, struct bootpc_ifcontext *ifctx,
 }
 
 static u_int
-bootpc_init_ifa_cb(void *arg, struct ifaddr *ifa, u_int count)
+bootpc_init_ifa_cb(void *arg, struct sockaddr *sa, u_int count)
 {
-	struct sockaddr_dl *sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+	struct sockaddr_dl *sdl = (struct sockaddr_dl *)sa;
 
 	if (count != 0)
 		return (0);
