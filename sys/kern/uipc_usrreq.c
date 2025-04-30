@@ -4200,6 +4200,24 @@ unp_dispose(struct socket *so)
 		m = STAILQ_FIRST(&sb->uxst_mbq);
 		STAILQ_INIT(&sb->uxst_mbq);
 		sb->sb_acc = sb->sb_ccc = sb->sb_ctl = sb->sb_mbcnt = 0;
+		/*
+		 * Trim M_NOTREADY buffers from the free list.  They are
+		 * referenced by the I/O thread.
+		 */
+		if (sb->uxst_fnrdy != NULL) {
+			struct mbuf *n, *prev;
+
+			while (m != NULL && m->m_flags & M_NOTREADY)
+				m = m->m_next;
+			for (prev = n = m; n != NULL; n = n->m_next) {
+				if (n->m_flags & M_NOTREADY) {
+					n = n->m_next;
+					prev->m_next = n;
+				} else
+					prev = n;
+			}
+			sb->uxst_fnrdy = NULL;
+		}
 		break;
 	}
 	/*
