@@ -9,6 +9,11 @@ extern "C" {
 #endif
 
 krb5_error_code
+hdb_add_current_keys_to_history (
+	krb5_context /*context*/,
+	hdb_entry */*entry*/);
+
+krb5_error_code
 hdb_add_master_key (
 	krb5_context /*context*/,
 	krb5_keyblock */*key*/,
