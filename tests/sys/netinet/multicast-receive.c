@@ -66,9 +66,11 @@ main(int argc, char *argv[])
 	bool index;
 
 	if (argc < 4)
-usage:
-		errx(1, "Usage: %s (ip_mreq|ip_mreqn|group_req) "
-		    "IPv4-group port interface", argv[0]);
+	usage:
+		errx(1,
+		    "Usage: %s (ip_mreq|ip_mreqn|group_req) "
+		    "IPv4-group port (if_addr|if_name|0)",
+		    argv[0]);
 
 	if (inet_pton(AF_INET, argv[2], &maddr) != 1)
 		err(1, "inet_pton(%s) failed", argv[2]);
@@ -81,7 +83,7 @@ usage:
 		ifindex = 0;
 		index = true;
 	} else
-		err(1, "if_nametoindex(%s) failed", argv[4]);
+		err(1, "failed to deduce address or interface: %s", argv[4]);
 
 	assert((s = socket(PF_INET, SOCK_DGRAM, 0)) > 0);
 	assert(bind(s, (struct sockaddr *)&sin, sizeof(sin)) == 0);
@@ -94,7 +96,7 @@ usage:
 			.imr_interface = ifaddr,
 		};
 		assert(setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq,
-		    sizeof(mreq)) == 0);
+			   sizeof(mreq)) == 0);
 	} else if (strcmp(argv[1], "ip_mreqn") == 0) {
 		/*
 		 * ip_mreqn shall be used with index, but for testing
@@ -102,11 +104,11 @@ usage:
 		 */
 		struct ip_mreqn mreqn = {
 			.imr_multiaddr = maddr,
-			.imr_address = index ? (struct in_addr){ 0 } : ifaddr,
+			.imr_address = index ? (struct in_addr) { 0 } : ifaddr,
 			.imr_ifindex = index ? ifindex : 0,
 		};
 		assert(setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreqn,
-		    sizeof(mreqn)) == 0);
+			   sizeof(mreqn)) == 0);
 	} else if (strcmp(argv[1], "group_req") == 0) {
 		if (!index)
 			errx(1, "group_req expects index");
@@ -117,12 +119,16 @@ usage:
 		gsa->sin_len = sizeof(struct sockaddr_in);
 		gsa->sin_addr = maddr;
 		assert(setsockopt(s, IPPROTO_IP, MCAST_JOIN_GROUP, &greq,
-		    sizeof(greq)) == 0);
+			   sizeof(greq)) == 0);
+
+		// limited testing of route based interface deduction
+		if (ifindex == 0)
+			return (0);
 	} else
 		goto usage;
 
 	assert((len = recvfrom(s, buf, sizeof(buf) - 1, 0,
-	    (struct sockaddr *)&sin, &slen)) > 0);
+		    (struct sockaddr *)&sin, &slen)) > 0);
 	buf[len] = '\0';
 	printf("%s:%u %s\n", inet_ntoa(sin.sin_addr), ntohs(sin.sin_port), buf);
 

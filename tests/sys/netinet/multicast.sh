@@ -140,6 +140,11 @@ MCAST_JOIN_GROUP_body()
 	    0.0.0.0 6676 233.252.0.1 6676 ${epair2}a hello
 	atf_check -s exit:0 sh -c "wait $pid; exit $?"
 	atf_check -s exit:0 -o inline:"192.0.3.1:6676 hello\n" cat out
+
+    # try to join group on route based selected interface
+    atf_check -s exit:0 \
+        jexec mjail2 $(atf_get_srcdir)/multicast-receive \
+        group_req 233.252.0.1 6676 0
 }
 MCAST_JOIN_GROUP_cleanup()
 {
